@@ -1,5 +1,7 @@
 import os
+import shutil
 import subprocess
+import tempfile
 import wave
 
 from runtime_paths import bin_path, subprocess_text_kwargs
@@ -103,15 +105,12 @@ def fit_wav_to_duration(
     os.makedirs(os.path.dirname(output_wav_path) or ".", exist_ok=True)
 
     if mode_key == "timeline":
-        # Timeline Priority: always cut the audio to the segment
-        # window. The end of the speech may be skipped if it exceeds
-        # the segment duration — playback continues with the next
-        # segment immediately after. No atempo, no early return.
-        if abs(fit_ratio - 1.0) < 0.02:
+        if fit_ratio >= 1.0 or abs(fit_ratio - 1.0) < 0.02:
             return input_wav_path
+        filter_chain = _build_atempo_filter(1.0 / fit_ratio)
         cmd = [
             ffmpeg, "-y", "-i", input_wav_path,
-            "-t", str(target_duration),
+            "-filter:a", filter_chain,
             "-ar", "16000", "-ac", "1",
             output_wav_path,
         ]
@@ -391,6 +390,9 @@ def build_voice_track_from_srt_segments(
         start_ms = int(float(seg.get("start", 0.0)) * 1000)
         end_ms = int(float(seg.get("end", 0.0)) * 1000)
         max_len = max(0, end_ms - start_ms)
+        if idx + 1 < len(segments):
+            next_start_ms = int(float(segments[idx + 1].get("start", 0.0)) * 1000)
+            max_len = max(0, next_start_ms - start_ms)
 
         clip = AudioSegment.from_file(wav_path)
         clip = clip.set_frame_rate(16000).set_channels(1)
@@ -417,6 +419,29 @@ def build_voice_track_from_srt_segments(
                     silent_ms = gap_ms - fade_ms
                     if silent_ms > 0:
                         clip = clip + AudioSegment.silent(duration=silent_ms, frame_rate=16000)
+            elif clip_len > max_len:
+                fit_dir = tempfile.mkdtemp(prefix="capcap_voice_fit_")
+                fit_path = os.path.join(fit_dir, f"segment_{idx:04d}.wav")
+                try:
+                    fitted_path = fit_wav_to_duration(
+                        input_wav_path=wav_path,
+                        output_wav_path=fit_path,
+                        target_duration_seconds=max_len / 1000.0,
+                        mode="force",
+                    )
+                    if fitted_path != wav_path and os.path.exists(fitted_path):
+                        clip = AudioSegment.from_file(fitted_path)
+                except (FileNotFoundError, OSError, RuntimeError):
+                    pass
+                finally:
+                    shutil.rmtree(fit_dir, ignore_errors=True)
+                if len(clip) > max_len:
+                    clip = clip[:max_len]
+                fade_ms = min(len(clip), 50)
+                if fade_ms > 0:
+                    clip = clip.fade_out(duration=fade_ms)
+        elif idx + 1 < len(segments):
+            continue
 
         final_clip_len = len(clip)
         base = base.overlay(clip, position=max(0, start_ms))

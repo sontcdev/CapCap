@@ -1068,9 +1068,6 @@ class VoiceWorkflow:
                         mode="smart",
                     )
             if (sync_mode or "off").strip().lower() in ("timeline", "timeline priority"):
-                # Timeline Priority: cut audio to fit the segment window,
-                # but extend to fill gaps to the next segment to minimize cutting.
-                # Calculate extended duration if there's a gap to next segment
                 extended_duration = target_duration
                 if idx + 1 < len(segments):
                     next_seg = segments[idx + 1]

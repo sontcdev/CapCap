@@ -727,8 +727,8 @@ class EditorTimeline(QGraphicsView):
         inside the same track. The new TS1 DubSubtitle layout inherits
         the stacking; legacy A2 Dub still does.
 
-        In Timeline Priority mode the audio is always cut to the
-        segment window, so no two layers can overlap in audio time.
+        In Timeline Priority mode the audio is fitted to the segment
+        window, so no two layers can overlap in audio time.
         Stacking is disabled and the track collapses to a single row.
         """
         is_subtitle = self._is_subtitle_track(track)
