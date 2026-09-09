@@ -217,6 +217,10 @@ def _connect_ui_signals(gui):
         gui.audio_mix_preset_combo.currentIndexChanged.connect(
             gui.on_audio_mix_preset_changed
         )
+    if hasattr(gui, "mute_original_during_transcript_cb"):
+        gui.mute_original_during_transcript_cb.toggled.connect(
+            gui.on_mute_original_during_transcript_toggled
+        )
     if hasattr(gui, "audio_a1_volume_slider"):
         gui.audio_a1_volume_slider.valueChanged.connect(
             gui.on_audio_a1_volume_changed
@@ -415,6 +419,10 @@ def _initialize_ui_state(gui):
     gui._preview_audio_track_mode = "both"
     gui._mute_original = False
     gui._mute_dubbed = False
+    gui._mute_original_during_transcript = False
+    gui._mute_original_sidecar_cache = {}
+    gui._mute_original_sidecar_error_signature = ""
+    gui._mute_original_sidecar_success_signature = ""
     gui._preview_audio_track_switching = False
     gui.live_preview_subtitle_path = ""
     gui.live_preview_ass_path = ""

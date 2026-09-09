@@ -843,12 +843,13 @@ class PreviewController:
                 hasher.update(chunk)
         return hasher.hexdigest()
 
-    def _build_styled_preview_signature(self, *, video_path: str, audio_path: str, mode: str, srt_path: str, subtitle_style: dict, mask_regions=None, logo_layers=None) -> str:
+    def _build_styled_preview_signature(self, *, video_path: str, audio_path: str, mode: str, srt_path: str, subtitle_style: dict, mask_regions=None, logo_layers=None, original_audio_gain_db: float = 0.0) -> str:
         payload = {
             "kind": "styled_preview_v2",
             "mode": mode,
             "video": self._file_signature(video_path),
             "audio": self._file_signature(audio_path),
+            "original_audio_gain_db": round(float(original_audio_gain_db or 0.0), 6),
             "subtitle_path": os.path.abspath(srt_path) if srt_path and os.path.exists(srt_path) else "",
             "subtitle_hash": self._text_file_hash(srt_path),
             "subtitle_style": subtitle_style or {},
@@ -899,6 +900,14 @@ class PreviewController:
         if str(mode or "").strip().lower() != "subtitle":
             return 0.0
         try:
+            if self.gui._is_audio_track_muted("A1 Audio"):
+                # Subtitle-only renders retain the source video's audio, so
+                # carry the existing per-track mute into the rendered audio
+                # filter rather than allowing the sidecar to bypass it.
+                return -120.0
+        except Exception:
+            pass
+        try:
             percent = int(self.gui.audio_a1_volume_slider.value())
             return float(self.gui._percent_to_db(percent))
         except Exception:
@@ -923,8 +932,12 @@ class PreviewController:
             if not chosen_audio:
                 # Fallback to cached audio if regeneration failed
                 chosen_audio = self.gui.resolve_selected_audio_path()
-        else:
-            chosen_audio = self.gui.resolve_selected_audio_path()
+        elif mode == "subtitle" and self.gui._original_transcript_mute_requested():
+            # Subtitle-only export normally keeps the source video's audio.
+            # When the optional A1 range mute is enabled, pass the derived
+            # sidecar explicitly so the export workflow can replace only that
+            # source track before burning subtitles.
+            chosen_audio = self.gui._resolve_preview_original_audio_path()
 
         # Check if audio needs regeneration due to changed settings
         if mode in ("voice", "both") and chosen_audio:
@@ -1059,8 +1072,8 @@ class PreviewController:
             chosen_audio = self._regenerate_mixed_audio_with_current_volumes()
             if not chosen_audio:
                 chosen_audio = self.gui.resolve_selected_audio_path()
-        else:
-            chosen_audio = self.gui.resolve_selected_audio_path()
+        elif mode == "subtitle" and self.gui._original_transcript_mute_requested():
+            chosen_audio = self.gui._resolve_preview_original_audio_path()
 
         if mode in ("subtitle", "both"):
             translated_srt_path = self._prepare_current_export_srt()
@@ -1357,13 +1370,14 @@ class PreviewController:
             self.gui.ensure_media_backend_ready()
         video_path = self.gui.video_path_edit.text().strip()
         mode = self._effective_render_mode_without_tts(self.gui.get_output_mode_key())
+        original_audio_gain_db = self._original_audio_gain_db_for_render(mode)
         audio_path = ""
         if mode in ("voice", "both"):
             audio_path = self._regenerate_mixed_audio_with_current_volumes()
             if not audio_path:
                 audio_path = self.gui.resolve_selected_audio_path()
-        else:
-            audio_path = self.gui.resolve_selected_audio_path()
+        elif mode == "subtitle" and self.gui._original_transcript_mute_requested():
+            audio_path = self.gui._resolve_preview_original_audio_path()
         if not video_path or not os.path.exists(video_path):
             self.gui.log("[Preview] Video file not found, showing error")
             QMessageBox.warning(self.gui, "Error", "Video file not found. Please select a video first.")
@@ -1393,6 +1407,10 @@ class PreviewController:
                 if hasattr(self.gui.video_view, "set_preview_scale_mode"):
                     self.gui.video_view.set_preview_scale_mode(self.gui.get_output_scale_mode_key())
                 self.gui.media_player.setSource(QUrl.fromLocalFile(video_path))
+                # The live subtitle path keeps the source video for playback;
+                # re-apply the shared A1 resolver so an enabled transcript
+                # mute sidecar is loaded here as well as in rendered paths.
+                self.gui.sync_preview_audio_track_to_output(apply_to_player=True, force=True)
                 self.gui.sync_live_subtitle_preview()
                 self.gui.refresh_ui_state()
             except Exception:
@@ -1420,6 +1438,7 @@ class PreviewController:
                 subtitle_style=subtitle_style,
                 mask_regions=mask_regions,
                 logo_layers=logo_layers,
+                original_audio_gain_db=original_audio_gain_db,
             )
             cached_preview = str(getattr(self.gui, "last_styled_preview_path", "") or "").strip()
             cached_signature = str(getattr(self.gui, "last_styled_preview_signature", "") or "").strip()
@@ -1481,6 +1500,7 @@ class PreviewController:
             mask_regions=mask_regions,
             logo_layers=logo_layers,
             temp_dir=self.gui.get_project_temp_dir("preview"),
+            original_audio_gain_db=original_audio_gain_db,
         )
         self.gui.preview_thread.finished.connect(
             lambda preview_path, error: self.gui.on_preview_ready(preview_path, error, styled_signature)

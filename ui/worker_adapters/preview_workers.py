@@ -15,7 +15,7 @@ from services import EngineRuntime
 class PreviewMuxWorker(QThread):
     finished = Signal(str, str)
 
-    def __init__(self, video_path, audio_path, output_path, mode="voice", srt_path="", subtitle_style=None, render_subtitles=True, target_width=None, target_height=None, output_scale_mode="fit", output_fill_focus_x=0.5, output_fill_focus_y=0.5, video_filter_state=None, mask_regions=None, logo_layers=None, temp_dir=""):
+    def __init__(self, video_path, audio_path, output_path, mode="voice", srt_path="", subtitle_style=None, render_subtitles=True, target_width=None, target_height=None, output_scale_mode="fit", output_fill_focus_x=0.5, output_fill_focus_y=0.5, video_filter_state=None, mask_regions=None, logo_layers=None, temp_dir="", original_audio_gain_db=0.0):
         super().__init__()
         self.video_path = video_path
         self.audio_path = audio_path
@@ -33,6 +33,7 @@ class PreviewMuxWorker(QThread):
         self.mask_regions = mask_regions or []
         self.logo_layers = logo_layers or []
         self.temp_dir = temp_dir
+        self.original_audio_gain_db = float(original_audio_gain_db or 0.0)
 
     def run(self):
         temp_mux_path = ""
@@ -80,6 +81,7 @@ class PreviewMuxWorker(QThread):
                     output_fill_focus_x=self.output_fill_focus_x,
                     output_fill_focus_y=self.output_fill_focus_y,
                     video_filter_state=self.video_filter_state,
+                    audio_gain_db=self.original_audio_gain_db if self.mode == "subtitle" else 0.0,
                     fast=True,
                 )
                 if not ok:
@@ -147,7 +149,11 @@ class QuickPreviewWorker(QThread):
             trim_video_clip(self.video_path, base_clip, self.start_seconds, self.duration_seconds)
 
             current_video = base_clip
-            if self.mode in ("voice", "both") and self.audio_path and os.path.exists(self.audio_path):
+            # Subtitle-only fast previews normally keep the trimmed source
+            # audio.  When the controller supplies an A1 transcript-mute
+            # sidecar, mux it here as well so the clip matches regular
+            # preview and export playback.
+            if self.audio_path and os.path.exists(self.audio_path):
                 voice_clip = os.path.join(temp_dir, f"preview_voice_{stamp}.mp4")
                 temp_paths.append(voice_clip)
                 mux_audio_into_video_clip_for_preview(

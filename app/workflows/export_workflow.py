@@ -157,50 +157,90 @@ class ExportWorkflow:
         text_ass_path="",
         text_image_layers=None,
         original_audio_gain_db=0.0,
+        audio_path="",
+        project_temp_dir="",
     ):
         print(f"[Export] _export_subtitle_video: mask_regions={mask_regions}, logo_layers={logo_layers}")
         print(f"[Export] ass_path={ass_path}, exists={os.path.exists(ass_path) if ass_path else False}")
         effective_ass_path = ass_path if ass_path and os.path.exists(ass_path) else text_ass_path
         secondary_text_ass = text_ass_path if effective_ass_path != text_ass_path else ""
-        if effective_ass_path and os.path.exists(effective_ass_path):
-            ok = self.engine_runtime.embed_ass_subtitles(
-                video_path,
-                effective_ass_path,
-                output_path,
-                blur_region=blur_regions if blur_regions else subtitle_style.get("blur_region"),
-                mask_regions=mask_regions,
-                logo_layers=logo_layers,
-                text_ass_path=secondary_text_ass,
-                text_image_layers=text_image_layers,
-                target_width=target_width,
-                target_height=target_height,
-                output_scale_mode=output_scale_mode,
-                output_fill_focus_x=output_fill_focus_x,
-                output_fill_focus_y=output_fill_focus_y,
-                output_fps=output_fps,
-                video_filter_state=video_filter_state,
-                audio_gain_db=original_audio_gain_db,
-            )
-        else:
-            ok = self.engine_runtime.embed_subtitles(
-                video_path,
-                srt_path,
-                output_path,
-                subtitle_style=self._subtitle_options(subtitle_style),
-                mask_regions=mask_regions,
-                logo_layers=logo_layers,
-                text_image_layers=text_image_layers,
-                target_width=target_width,
-                target_height=target_height,
-                output_scale_mode=output_scale_mode,
-                output_fill_focus_x=output_fill_focus_x,
-                output_fill_focus_y=output_fill_focus_y,
-                output_fps=output_fps,
-                video_filter_state=video_filter_state,
-                audio_gain_db=original_audio_gain_db,
-            )
-        if not ok:
-            raise RuntimeError("Failed to burn subtitles into the output video.")
+        rendered_video_path = video_path
+        generated_audio_mux_path = ""
+        if audio_path and os.path.exists(audio_path):
+            if os.path.abspath(audio_path) != os.path.abspath(video_path):
+                temp_dir = str(project_temp_dir or "").strip() or os.path.join(self.workspace_root, "temp")
+                os.makedirs(temp_dir, exist_ok=True)
+                generated_audio_mux_path = os.path.join(
+                    temp_dir, f"subtitle_audio_mux_{time.time_ns()}.mp4"
+                )
+                print(f"[Export] Replacing subtitle export A1 audio with sidecar: {audio_path}")
+                try:
+                    self.engine_runtime.mux_audio_for_preview(
+                        video_path,
+                        audio_path,
+                        generated_audio_mux_path,
+                        target_width=None,
+                        target_height=None,
+                        output_scale_mode=output_scale_mode,
+                        focus_x=output_fill_focus_x,
+                        focus_y=output_fill_focus_y,
+                        output_fps=None,
+                        video_filter_state={},
+                    )
+                except Exception:
+                    if os.path.exists(generated_audio_mux_path):
+                        try:
+                            os.remove(generated_audio_mux_path)
+                        except OSError:
+                            pass
+                    raise
+                rendered_video_path = generated_audio_mux_path
+        try:
+            if effective_ass_path and os.path.exists(effective_ass_path):
+                ok = self.engine_runtime.embed_ass_subtitles(
+                    rendered_video_path,
+                    effective_ass_path,
+                    output_path,
+                    blur_region=blur_regions if blur_regions else subtitle_style.get("blur_region"),
+                    mask_regions=mask_regions,
+                    logo_layers=logo_layers,
+                    text_ass_path=secondary_text_ass,
+                    text_image_layers=text_image_layers,
+                    target_width=target_width,
+                    target_height=target_height,
+                    output_scale_mode=output_scale_mode,
+                    output_fill_focus_x=output_fill_focus_x,
+                    output_fill_focus_y=output_fill_focus_y,
+                    output_fps=output_fps,
+                    video_filter_state=video_filter_state,
+                    audio_gain_db=original_audio_gain_db,
+                )
+            else:
+                ok = self.engine_runtime.embed_subtitles(
+                    rendered_video_path,
+                    srt_path,
+                    output_path,
+                    subtitle_style=self._subtitle_options(subtitle_style),
+                    mask_regions=mask_regions,
+                    logo_layers=logo_layers,
+                    text_image_layers=text_image_layers,
+                    target_width=target_width,
+                    target_height=target_height,
+                    output_scale_mode=output_scale_mode,
+                    output_fill_focus_x=output_fill_focus_x,
+                    output_fill_focus_y=output_fill_focus_y,
+                    output_fps=output_fps,
+                    video_filter_state=video_filter_state,
+                    audio_gain_db=original_audio_gain_db,
+                )
+            if not ok:
+                raise RuntimeError("Failed to burn subtitles into the output video.")
+        finally:
+            if generated_audio_mux_path and os.path.exists(generated_audio_mux_path):
+                try:
+                    os.remove(generated_audio_mux_path)
+                except OSError:
+                    pass
 
     def _extract_overlay_layers(self, state):
         from app.layers.text import TEXT_LAYER_EXPORT_SCALE
@@ -634,6 +674,8 @@ class ExportWorkflow:
                     blur_regions=blur_regions,
                     text_image_layers=text_image_layers,
                     original_audio_gain_db=original_audio_gain_db,
+                    audio_path=audio_path,
+                    project_temp_dir=project_temp_dir,
                 )
             elif mode == "voice":
                 self._emit_progress(on_progress, 25, "Muxing Vietnamese audio into the video...")

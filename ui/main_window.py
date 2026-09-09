@@ -39,7 +39,7 @@ from helpers import (
 )
 from new_highlight_selector import auto_select_matches
 from video_processor import srt_to_ass
-from audio_mixer import ffprobe_wav_duration
+from audio_mixer import ffprobe_wav_duration, mute_audio_ranges, normalize_transcript_mute_ranges
 from utils.display_utils import (
     cleanup_temp_preview_files as cleanup_temp_preview_files_impl,
     clear_log as clear_log_impl,
@@ -2468,7 +2468,7 @@ class VideoTranslatorGUI(QMainWindow):
         _load_all()
         dialog.exec()
 
-    def _missing_resource_entries(self, *, include_whisper: bool = False, include_voice: bool = False, include_ocr: bool = False, validate_pipeline_runtime: bool = False) -> list[tuple[str, str]]:
+    def _missing_resource_entries(self, *, include_whisper: bool = False, include_voice: bool = False, include_ocr: bool = False, include_audio_separation: bool = False, validate_pipeline_runtime: bool = False) -> list[tuple[str, str]]:
         service = self._resource_service()
         missing: list[tuple[str, str]] = []
 
@@ -2496,6 +2496,9 @@ class VideoTranslatorGUI(QMainWindow):
         if include_ocr:
             missing.extend(service.validate_ocr_runtime())
 
+        if include_audio_separation:
+            missing.extend(service.validate_audio_separation_runtime())
+
         if include_voice and not is_remote_profile():
             missing.extend(service.validate_piper_voice_runtime(self.get_active_voice_name()))
 
@@ -2511,11 +2514,12 @@ class VideoTranslatorGUI(QMainWindow):
             deduped.append(item)
         return deduped
 
-    def ensure_required_resources(self, action_label: str, *, include_whisper: bool = False, include_voice: bool = False, include_ocr: bool = False, validate_pipeline_runtime: bool = False) -> bool:
+    def ensure_required_resources(self, action_label: str, *, include_whisper: bool = False, include_voice: bool = False, include_ocr: bool = False, include_audio_separation: bool = False, validate_pipeline_runtime: bool = False) -> bool:
         missing = self._missing_resource_entries(
             include_whisper=include_whisper,
             include_voice=include_voice,
             include_ocr=include_ocr,
+            include_audio_separation=include_audio_separation,
             validate_pipeline_runtime=validate_pipeline_runtime,
         )
         if not missing:
@@ -2866,6 +2870,41 @@ class VideoTranslatorGUI(QMainWindow):
             timer.timeout.connect(lambda: self.sync_preview_audio_track_to_output(apply_to_player=True, force=True))
             self._music_preview_refresh_timer = timer
         timer.start(0 if force else 120)
+
+    def _mute_original_during_transcript_enabled(self) -> bool:
+        checkbox = getattr(self, "mute_original_during_transcript_cb", None)
+        if checkbox is not None:
+            try:
+                return bool(checkbox.isChecked())
+            except RuntimeError:
+                pass
+        return bool(getattr(self, "_mute_original_during_transcript", False))
+
+    def _original_transcript_mute_ranges(self) -> list[tuple[float, float]]:
+        return normalize_transcript_mute_ranges(
+            list(getattr(self, "current_segments", None) or [])
+        )
+
+    def _original_transcript_mute_requested(self) -> bool:
+        return bool(
+            self._mute_original_during_transcript_enabled()
+            and self._original_transcript_mute_ranges()
+        )
+
+    def _invalidate_original_audio_mute_cache(self, *, refresh: bool = False) -> None:
+        self._mute_original_sidecar_cache = {}
+        self._mute_original_sidecar_error_signature = ""
+        self._mute_original_sidecar_success_signature = ""
+        if refresh:
+            self._schedule_preview_audio_refresh(force=True)
+
+    def on_mute_original_during_transcript_toggled(self, checked: bool) -> None:
+        self._mute_original_during_transcript = bool(checked)
+        self._invalidate_original_audio_mute_cache(refresh=True)
+        try:
+            self.persist_current_timeline_project_data()
+        except Exception as exc:
+            self.log(f"[Audio] Could not persist transcript mute setting: {exc}")
 
     def _resolve_preview_voice_only_audio_path(self) -> str:
         if self.using_existing_audio_source():
@@ -3259,24 +3298,40 @@ class VideoTranslatorGUI(QMainWindow):
             self._preview_audio_track_switching = False
         self.schedule_timeline_visual_refresh(waveform=True, thumbnails=True)
 
-    def _resolve_preview_original_audio_path(self) -> str:
+    def _resolve_preview_raw_original_audio_path(self) -> str:
         """Resolve the original audio file path (separate from source video).
 
         A1 always represents the source video's original audio.  Audio
         Processing/Clean mode no longer changes this track; separated stems
         are only used when the user explicitly adds a Music Layer.
         """
+        # Clean-mode transcription temporarily points the audio controls at
+        # the separated vocal stem.  That stem is intentionally silent in
+        # non-speech gaps, so it must never become A1's source audio.
+        vocal_paths = set()
+        for candidate in (
+            self.processed_artifacts.get("vocals"),
+            getattr(self, "last_vocals_path", ""),
+        ):
+            normalized = self._normalize_local_file_path(candidate)
+            if normalized:
+                vocal_paths.add(os.path.normcase(os.path.abspath(normalized)))
+
         candidates: list[str] = []
         candidates.extend([
             self.processed_artifacts.get("extracted_audio"),
+            self.processed_artifacts.get("audio_extracted"),
             self.last_extracted_audio,
-            self.audio_source_edit.text().strip() if hasattr(self, "audio_source_edit") else "",
         ])
         for candidate in candidates:
             if not candidate:
                 continue
             normalized = self._normalize_local_file_path(candidate)
-            if normalized and os.path.exists(normalized):
+            if (
+                normalized
+                and os.path.exists(normalized)
+                and os.path.normcase(os.path.abspath(normalized)) not in vocal_paths
+            ):
                 return normalized
         # Final fallback: the source video file itself. mpv runs with
         # `ao=null` (video-only) and audio is routed through the A1
@@ -3291,6 +3346,60 @@ class VideoTranslatorGUI(QMainWindow):
         if source_video:
             return source_video
         return ""
+
+    def _resolve_preview_original_audio_path(self) -> str:
+        """Resolve A1 audio, optionally using a cached transcript mute sidecar."""
+        raw_path = self._resolve_preview_raw_original_audio_path()
+        if not raw_path or not self._original_transcript_mute_requested():
+            return raw_path
+
+        ranges = self._original_transcript_mute_ranges()
+        try:
+            source_stat = os.stat(raw_path)
+            source_identity = {
+                "path": os.path.abspath(raw_path),
+                "size": int(source_stat.st_size),
+                "mtime_ns": int(getattr(source_stat, "st_mtime_ns", int(source_stat.st_mtime * 1e9))),
+            }
+            key_payload = {"source": source_identity, "ranges": ranges}
+            signature = hashlib.sha1(
+                json.dumps(key_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            cached_path = str(getattr(self, "_mute_original_sidecar_cache", {}).get(signature, "") or "")
+            if cached_path and os.path.exists(cached_path):
+                self._mute_original_sidecar_success_signature = signature
+                return cached_path
+            sidecar_path = self.get_project_temp_path(
+                "audio_mute",
+                f"original_{signature}.wav",
+                create_parent=True,
+            )
+            if os.path.exists(sidecar_path):
+                self._mute_original_sidecar_cache[signature] = sidecar_path
+                self._mute_original_sidecar_success_signature = signature
+                return sidecar_path
+
+            processed_path = mute_audio_ranges(
+                raw_path,
+                sidecar_path,
+                list(getattr(self, "current_segments", None) or []),
+            )
+            if not processed_path or os.path.abspath(processed_path) == os.path.abspath(raw_path):
+                return raw_path
+            self._mute_original_sidecar_cache[signature] = processed_path
+            self._mute_original_sidecar_success_signature = signature
+            self._mute_original_sidecar_error_signature = ""
+            return processed_path
+        except Exception as exc:
+            error_signature = f"{os.path.abspath(raw_path)}|{ranges!r}|{type(exc).__name__}"
+            if error_signature != getattr(self, "_mute_original_sidecar_error_signature", ""):
+                self.log(
+                    "[Audio] Could not mute A1 during the original transcript "
+                    f"ranges ({exc}); using the unprocessed original audio."
+                )
+                self._mute_original_sidecar_error_signature = error_signature
+            self._mute_original_sidecar_success_signature = ""
+            return raw_path
 
     def on_preview_audio_track_changed(self, index: int):
         if getattr(self, "_preview_audio_track_switching", False) or not hasattr(self, "preview_audio_track_combo"):
@@ -3600,6 +3709,13 @@ class VideoTranslatorGUI(QMainWindow):
             self.seek_frame_preview_timer.stop()
 
     def schedule_live_subtitle_preview_refresh(self):
+        # Transcript edits change the source-time ranges used by the optional
+        # A1 mute sidecar.  Drop the derived file before the preview timer
+        # runs so the preview cannot keep playing an old range map.
+        if hasattr(self, "_mute_original_sidecar_cache"):
+            self._invalidate_original_audio_mute_cache(
+                refresh=self._mute_original_during_transcript_enabled()
+            )
         if not hasattr(self, "live_subtitle_preview_timer"):
             return
         self.live_subtitle_preview_timer.start()
@@ -4299,6 +4415,10 @@ class VideoTranslatorGUI(QMainWindow):
             "M1": bool(getattr(self, "_mask_track_preview_visible", True)),
             "B1": bool(self._blur_effect_enabled()),
         })
+        state.set_setting(
+            "mute_original_during_transcript",
+            bool(self._mute_original_during_transcript_enabled()),
+        )
         state.set_setting("subtitle_style_controls", self._current_subtitle_style_controls_state())
         
         # Save timeline data (includes mask and logo layers)
@@ -4470,6 +4590,15 @@ class VideoTranslatorGUI(QMainWindow):
         self._text_track_preview_visible = bool(preview_visibility.get("T1 Text", True))
         self._logo_track_preview_visible = bool(preview_visibility.get("L1 Logo", True))
         self._mask_track_preview_visible = bool(preview_visibility.get("M1", True))
+        saved_mute_original = bool(
+            getattr(state, "settings", {}).get("mute_original_during_transcript", False)
+        )
+        self._mute_original_during_transcript = saved_mute_original
+        if hasattr(self, "mute_original_during_transcript_cb"):
+            self.mute_original_during_transcript_cb.blockSignals(True)
+            self.mute_original_during_transcript_cb.setChecked(saved_mute_original)
+            self.mute_original_during_transcript_cb.blockSignals(False)
+        self._invalidate_original_audio_mute_cache()
         saved_subtitle_style = dict(getattr(state, "settings", {}).get("subtitle_style_controls") or {})
         if saved_subtitle_style:
             self._apply_subtitle_style_controls_state(saved_subtitle_style)
@@ -4523,6 +4652,9 @@ class VideoTranslatorGUI(QMainWindow):
         self.current_translated_segment_models = context["current_translated_segment_models"]
         self.current_segments = context["current_segments"]
         self.current_translated_segments = context["current_translated_segments"]
+        self._invalidate_original_audio_mute_cache(
+            refresh=self._mute_original_during_transcript_enabled()
+        )
         self.refresh_detected_speakers_section()
         if self.current_translated_segments:
             self.refresh_auto_keyword_highlights(force=True)
@@ -10834,6 +10966,10 @@ class VideoTranslatorGUI(QMainWindow):
                 self.current_translated_segments = parsed_translated
 
         self.sync_segment_editor_rows()
+        if hasattr(self, "_mute_original_sidecar_cache"):
+            self._invalidate_original_audio_mute_cache(
+                refresh=self._mute_original_during_transcript_enabled()
+            )
 
     def _sync_hidden_translated_text_from_segments(self):
         if getattr(self, "_syncing_segment_editor", False):
@@ -10886,6 +11022,23 @@ class VideoTranslatorGUI(QMainWindow):
                 segments_list[index]["voice_speed"] = round(float(value), 1)
                 self._voiceover_force_refresh = True
         self.persist_current_timeline_project_data()
+
+    def apply_voice_speed_to_all_segments(self):
+        speed = round(self._parse_voice_speed_value(), 1)
+        updated_count = 0
+        for segments_list in (self.current_translated_segments, self.current_segments):
+            for segment in segments_list or []:
+                if isinstance(segment, dict):
+                    segment["voice_speed"] = speed
+                    updated_count += 1
+        if not updated_count:
+            self.log("[Voice Speed] No subtitle segments available to update.")
+            return
+        self._voiceover_force_refresh = True
+        self.persist_current_timeline_project_data()
+        self.sync_segment_editor_rows()
+        self.refresh_ui_state()
+        self.log(f"[Voice Speed] Applied {speed:.1f}x to all subtitle segments.")
 
     def _set_segment_editor_highlight(self, active_index: int):
         rows = getattr(self, "_segment_editor_rows", [])
@@ -12224,6 +12377,9 @@ class VideoTranslatorGUI(QMainWindow):
             state.set_setting("transcription_signature", "")
             self.project_service.save_project(state)
         self._sync_segment_models_from_current_segments()
+        self._invalidate_original_audio_mute_cache(
+            refresh=self._mute_original_during_transcript_enabled()
+        )
         if hasattr(self, "timeline"):
             self.timeline.set_segments(self.current_segments)
             self.schedule_timeline_visual_refresh(waveform=True, thumbnails=True)
@@ -13388,6 +13544,8 @@ class VideoTranslatorGUI(QMainWindow):
         audio_src = self.audio_source_edit.text()
         if not audio_src or not os.path.exists(audio_src):
             QMessageBox.warning(self, "Error", "Please extract audio or select a source first!")
+            return
+        if not self.ensure_required_resources("Vocal Separation", include_audio_separation=True):
             return
         
         target_dir = self.audio_folder_edit.text()
@@ -14795,6 +14953,7 @@ class VideoTranslatorGUI(QMainWindow):
             "Generate",
             include_whisper=not is_ocr,
             include_voice=include_voice,
+            include_audio_separation=self.get_audio_handling_mode() == "clean" and self.get_output_mode_key() in ("voice", "both"),
             include_ocr=is_ocr,
             validate_pipeline_runtime=True,
         ):
@@ -14825,6 +14984,7 @@ class VideoTranslatorGUI(QMainWindow):
             "Generate",
             include_whisper=not is_ocr,
             include_voice=include_voice,
+            include_audio_separation=self.get_audio_handling_mode() == "clean" and mode in ("voice", "both"),
             include_ocr=is_ocr,
             validate_pipeline_runtime=True,
         ):
@@ -14890,6 +15050,12 @@ class VideoTranslatorGUI(QMainWindow):
         self.current_translated_segment_models = []
         self.current_segments = []
         self.current_translated_segments = []
+        self._mute_original_during_transcript = False
+        self._invalidate_original_audio_mute_cache()
+        if hasattr(self, "mute_original_during_transcript_cb"):
+            self.mute_original_during_transcript_cb.blockSignals(True)
+            self.mute_original_during_transcript_cb.setChecked(False)
+            self.mute_original_during_transcript_cb.blockSignals(False)
         self.processed_artifacts = {}
         self.last_extracted_audio = ""
         self.last_vocals_path = ""

@@ -5,7 +5,7 @@ class FFmpegAdapter:
     def extract_audio(self, video_path: str, audio_output_path: str) -> bool:
         return extract_audio(video_path, audio_output_path)
 
-    def embed_subtitles(self, video_path: str, srt_path: str, output_path: str, *, subtitle_style=None, mask_regions=None, logo_layers=None, text_ass_path="", text_image_layers=None, target_width=None, target_height=None, output_scale_mode="fit", output_fill_focus_x=0.5, output_fill_focus_y=0.5, output_fps=None, video_filter_state=None, fast=False) -> bool:
+    def embed_subtitles(self, video_path: str, srt_path: str, output_path: str, *, subtitle_style=None, mask_regions=None, logo_layers=None, text_ass_path="", text_image_layers=None, target_width=None, target_height=None, output_scale_mode="fit", output_fill_focus_x=0.5, output_fill_focus_y=0.5, output_fps=None, video_filter_state=None, audio_gain_db=0.0, fast=False) -> bool:
         subtitle_style = subtitle_style or {}
         return embed_subtitles(
             video_path,
@@ -51,6 +51,7 @@ class FFmpegAdapter:
             output_fill_focus_y=output_fill_focus_y,
             output_fps=output_fps,
             video_filter_state=video_filter_state,
+            audio_gain_db=audio_gain_db,
             fast=fast,
         )
 

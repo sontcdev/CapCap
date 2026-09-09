@@ -1,4 +1,5 @@
 import os
+import math
 import shutil
 import subprocess
 import tempfile
@@ -292,6 +293,204 @@ def _require_pydub():
             "python -m pip install pydub\n"
             f"Original error: {e}"
         ) from e
+
+
+def normalize_transcript_mute_ranges(
+    transcript_ranges: list | None,
+    *,
+    duration_seconds: float | None = None,
+) -> list[tuple[float, float]]:
+    """Return sorted, merged ranges for hard-muting original audio.
+
+    Only non-empty transcript segments with finite timestamps are accepted.
+    Negative timestamps are clamped to zero and, when the source duration is
+    known, timestamps past the end of the source are clamped to that duration.
+    """
+    duration = None
+    try:
+        candidate_duration = float(duration_seconds)
+        if math.isfinite(candidate_duration) and candidate_duration > 0.0:
+            duration = candidate_duration
+    except (TypeError, ValueError):
+        pass
+
+    ranges: list[tuple[float, float]] = []
+    for segment in transcript_ranges or []:
+        if not isinstance(segment, dict):
+            continue
+        if not str(segment.get("text", "") or "").strip():
+            continue
+        try:
+            start = float(segment.get("start"))
+            end = float(segment.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end):
+            continue
+        start = max(0.0, start)
+        end = max(0.0, end)
+        if duration is not None:
+            start = min(start, duration)
+            end = min(end, duration)
+        if end <= start:
+            continue
+        ranges.append((start, end))
+
+    if not ranges:
+        return []
+    ranges.sort(key=lambda item: (item[0], item[1]))
+    merged: list[tuple[float, float]] = [ranges[0]]
+    for start, end in ranges[1:]:
+        previous_start, previous_end = merged[-1]
+        if start <= previous_end:
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return [(round(start, 9), round(end, 9)) for start, end in merged]
+
+
+def _atomic_replace_path(write_path: str, output_path: str) -> str:
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    os.replace(write_path, output_path)
+    return output_path
+
+
+def _mute_wav_file(
+    input_audio_path: str,
+    output_audio_path: str,
+    ranges: list[tuple[float, float]],
+) -> str:
+    with wave.open(input_audio_path, "rb") as source:
+        params = source.getparams()
+        frame_rate = int(source.getframerate() or 0)
+        frame_count = int(source.getnframes() or 0)
+        frame_width = int(source.getnchannels() or 0) * int(source.getsampwidth() or 0)
+        raw = bytearray(source.readframes(frame_count))
+
+    if frame_rate <= 0 or frame_count <= 0 or frame_width <= 0:
+        return input_audio_path
+
+    silence_sample = b"\x80" if params.sampwidth == 1 else b"\x00"
+    silence_frame = silence_sample * int(params.nchannels) * int(params.sampwidth)
+    if not silence_frame:
+        return input_audio_path
+    for start, end in ranges:
+        first_frame = max(0, min(frame_count, int(math.floor(start * frame_rate))))
+        last_frame = max(0, min(frame_count, int(math.ceil(end * frame_rate))))
+        if last_frame <= first_frame:
+            continue
+        first_byte = first_frame * frame_width
+        last_byte = last_frame * frame_width
+        raw[first_byte:last_byte] = silence_frame * (last_frame - first_frame)
+
+    output_dir = os.path.dirname(os.path.abspath(output_audio_path)) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix=".capcap_mute_", suffix=".wav", dir=output_dir)
+    os.close(fd)
+    try:
+        with wave.open(temporary_path, "wb") as target:
+            target.setparams(params)
+            target.writeframes(bytes(raw))
+        return _atomic_replace_path(temporary_path, output_audio_path)
+    finally:
+        if os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+
+def _mute_decoded_audio_file(
+    input_audio_path: str,
+    output_audio_path: str,
+    transcript_ranges: list,
+) -> str:
+    _require_pydub()
+    from pydub import AudioSegment
+
+    audio = AudioSegment.from_file(input_audio_path)
+    frame_rate = int(audio.frame_rate or 0)
+    duration_seconds = len(audio) / 1000.0
+    ranges = normalize_transcript_mute_ranges(
+        transcript_ranges,
+        duration_seconds=duration_seconds,
+    )
+    if not ranges or frame_rate <= 0 or audio.frame_width <= 0:
+        return input_audio_path
+
+    raw = bytearray(audio.raw_data)
+    frame_width = int(audio.frame_width)
+    # pydub exposes decoded raw PCM as signed samples, including 8-bit audio.
+    # The WAV writer below handles the unsigned 8-bit representation itself.
+    silence_sample = b"\x00"
+    silence_frame = silence_sample * int(audio.channels) * int(audio.sample_width)
+    frame_count = len(raw) // frame_width
+    for start, end in ranges:
+        first_frame = max(0, min(frame_count, int(math.floor(start * frame_rate))))
+        last_frame = max(0, min(frame_count, int(math.ceil(end * frame_rate))))
+        if last_frame <= first_frame:
+            continue
+        first_byte = first_frame * frame_width
+        last_byte = last_frame * frame_width
+        raw[first_byte:last_byte] = silence_frame * (last_frame - first_frame)
+
+    muted = AudioSegment(
+        data=bytes(raw),
+        sample_width=audio.sample_width,
+        frame_rate=audio.frame_rate,
+        channels=audio.channels,
+    )
+    output_dir = os.path.dirname(os.path.abspath(output_audio_path)) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix=".capcap_mute_", suffix=".wav", dir=output_dir)
+    os.close(fd)
+    try:
+        muted.export(temporary_path, format="wav")
+        return _atomic_replace_path(temporary_path, output_audio_path)
+    finally:
+        if os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+
+def mute_audio_ranges(
+    input_audio_path: str,
+    output_audio_path: str,
+    transcript_ranges: list | None = None,
+) -> str:
+    """Create a sidecar with exact hard-silence over transcript intervals.
+
+    The input is never modified.  If the input is a PCM WAV, its channels,
+    sample width, sample rate, and frame count are copied byte-for-byte except
+    for the muted frames.  Other media is decoded by pydub/ffmpeg and written
+    as a WAV sidecar while retaining the decoded format properties.
+    """
+    if not input_audio_path or not os.path.exists(input_audio_path):
+        raise FileNotFoundError(f"Input audio not found: {input_audio_path}")
+    if not output_audio_path or os.path.abspath(input_audio_path) == os.path.abspath(output_audio_path):
+        return input_audio_path
+
+    duration_seconds = None
+    try:
+        with wave.open(input_audio_path, "rb") as source:
+            frame_rate = int(source.getframerate() or 0)
+            frame_count = int(source.getnframes() or 0)
+            if frame_rate > 0:
+                duration_seconds = frame_count / float(frame_rate)
+    except (wave.Error, OSError):
+        pass
+    ranges = normalize_transcript_mute_ranges(
+        transcript_ranges,
+        duration_seconds=duration_seconds,
+    )
+    if not ranges:
+        return input_audio_path
+    try:
+        return _mute_wav_file(input_audio_path, output_audio_path, ranges)
+    except (wave.Error, EOFError, OSError):
+        return _mute_decoded_audio_file(input_audio_path, output_audio_path, transcript_ranges)
 
 
 def _merge_ducking_ranges(

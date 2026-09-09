@@ -499,7 +499,6 @@ def build_start_group(gui, left_layout):
     gui.voice_speed_spin.setEditable(True)
     gui.voice_speed_spin.addItems(["0.8x", "0.9x", "1.0x", "1.1x", "1.2x", "1.3x", "1.4x", "1.5x", "1.6x", "1.8x", "2.0x"])
     gui.voice_speed_spin.setCurrentText("1.0x")
-    gui.voice_speed_spin.hide()
     gui.voice_timing_sync_combo = QComboBox()
     gui.voice_timing_sync_combo.addItems(["Off", "Smart", "Timeline Priority", "Force Fit"])
     gui.voice_timing_sync_combo.setCurrentText("Smart")
@@ -551,6 +550,16 @@ def build_start_group(gui, left_layout):
     fast_voice_layout.addWidget(QLabel("Voice type"))
     fast_voice_layout.addWidget(gui.voice_gender_combo)
     voice_setup_layout.addWidget(gui.fast_voice_panel)
+    voice_speed_row = QHBoxLayout()
+    voice_speed_row.setContentsMargins(0, 0, 0, 0)
+    voice_speed_row.setSpacing(8)
+    voice_speed_row.addWidget(QLabel("Voice Speed (All)"))
+    voice_speed_row.addWidget(gui.voice_speed_spin, 1)
+    gui.apply_voice_speed_all_btn = QPushButton("Apply to all")
+    gui.apply_voice_speed_all_btn.setToolTip("Apply this voice speed to every subtitle segment.")
+    gui.apply_voice_speed_all_btn.clicked.connect(gui.apply_voice_speed_to_all_segments)
+    voice_speed_row.addWidget(gui.apply_voice_speed_all_btn)
+    voice_setup_layout.addLayout(voice_speed_row)
     # Voice preview belongs to the global/default voice configuration.  It is
     # deliberately kept outside the per-speaker diarization controls below.
     voice_setup_layout.addWidget(gui.preview_voice_btn)
@@ -925,6 +934,17 @@ def build_start_group(gui, left_layout):
     gui.audio_mix_preset_hint_label.setObjectName("helperLabel")
     gui.audio_mix_preset_hint_label.setWordWrap(True)
     audio_mix_inner_layout.addWidget(gui.audio_mix_preset_hint_label)
+    gui.mute_original_during_transcript_cb = QCheckBox(
+        "Mute Original during transcript",
+        gui,
+    )
+    gui.mute_original_during_transcript_cb.setChecked(False)
+    gui.mute_original_during_transcript_cb.setToolTip(
+        "Mute source A1 audio, including music and effects, during non-empty "
+        "original transcript times. Outside those intervals, A1 follows its "
+        "volume and mute setting."
+    )
+    audio_mix_inner_layout.addWidget(gui.mute_original_during_transcript_cb)
     audio_mix_layout.addWidget(audio_mix_inner_card)
 
     audio_tracks_card, audio_tracks_layout = _section_card()

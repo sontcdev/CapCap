@@ -349,6 +349,8 @@ class PrepareWorkflow:
                 readiness_issues.extend(resource_service.validate_ocr_runtime())
             elif is_sensevoice:
                 readiness_issues.extend(resource_service.validate_sensevoice_runtime())
+            if mode in ("voice", "both") and str(audio_handling_mode or "fast").strip().lower() == "clean":
+                readiness_issues.extend(resource_service.validate_audio_separation_runtime())
             if prefetch_voice_name:
                 readiness_issues.extend(
                     resource_service.validate_piper_voice_runtime(prefetch_voice_name)

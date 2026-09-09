@@ -16,6 +16,11 @@ from runtime_paths import app_path, bin_path, bundle_root, join_root, models_pat
 
 
 class ResourceDownloadService:
+    AUDIO_SEPARATION_MODEL = "UVR-MDX-NET-Inst_HQ_3.onnx"
+    AUDIO_SEPARATION_MODEL_URL = (
+        "https://huggingface.co/seanghay/uvr_models/resolve/main/"
+        "UVR-MDX-NET-Inst_HQ_3.onnx"
+    )
     WHISPER_ZIP_FILES = {
         "base": "models--Systran--faster-whisper-base.zip",
         "small": "models--Systran--faster-whisper-small.zip",
@@ -66,6 +71,7 @@ class ResourceDownloadService:
         "cuda:whisper",
         "diarization:segmentation",
         "diarization:embedding",
+        "audio_separation:model",
         "voice:pack",
         "voice:pack-en",
     }
@@ -602,6 +608,17 @@ class ResourceDownloadService:
                 ))
         return issues
 
+    def validate_audio_separation_runtime(self) -> list[tuple[str, str]]:
+        model_path = bin_path(self.AUDIO_SEPARATION_MODEL)
+        if os.path.isfile(model_path) and os.path.getsize(model_path) > 0:
+            return []
+        return [
+            (
+                "audio_separation:model",
+                f"Audio separation model is missing: {model_path}",
+            )
+        ]
+
     @staticmethod
     def is_nvidia_driver_available() -> bool:
         import subprocess
@@ -771,6 +788,17 @@ class ResourceDownloadService:
                 "auto_download_supported": True,
                 "description": "ONNX model that identifies and groups speaker voices.",
             },
+            {
+                "id": "audio_separation:model",
+                "name": "Vocal Separation Model (UVR MDX-NET)",
+                "kind": "audio_separation",
+                "status": "installed" if self.is_resource_installed("audio_separation:model") else "missing",
+                "target_dir": join_root("bin"),
+                "download_url": self.AUDIO_SEPARATION_MODEL_URL,
+                "expected_filename": self.AUDIO_SEPARATION_MODEL,
+                "auto_download_supported": True,
+                "description": "ONNX model used by Clean Voice mode to separate vocals and background audio.",
+            },
         ]
 
         vietnamese_entries = self._piper_voice_entries("vi")
@@ -827,6 +855,8 @@ class ResourceDownloadService:
             return os.path.isfile(self._speaker_diarization_segmentation_path())
         if resource_id == "diarization:embedding":
             return os.path.isfile(self._speaker_diarization_embedding_path())
+        if resource_id == "audio_separation:model":
+            return bool(self.validate_audio_separation_runtime() == [])
         if resource_id.startswith("whisper:"):
             model_name = resource_id.split(":", 1)[1].strip().lower()
             for model_dir in self._whisper_cache_dirs(model_name):
@@ -1170,6 +1200,22 @@ class ResourceDownloadService:
                 raise RuntimeError("Speaker embedding download completed, but the ONNX model was not found.")
             if progress_cb:
                 progress_cb(100, "Speaker embedding model is ready.")
+            return
+
+        if resource_id == "audio_separation:model":
+            destination = join_root("bin", self.AUDIO_SEPARATION_MODEL)
+            self._download_file(
+                self.AUDIO_SEPARATION_MODEL_URL,
+                destination,
+                progress_cb,
+                "Downloading vocal separation model...",
+            )
+            if not self.is_resource_installed(resource_id):
+                raise RuntimeError(
+                    "Vocal separation download completed, but the ONNX model was not found."
+                )
+            if progress_cb:
+                progress_cb(100, "Vocal separation model is ready.")
             return
 
         if resource_id == "cuda:whisper":
