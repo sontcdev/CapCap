@@ -1,7 +1,9 @@
 ﻿import os
+import subprocess
 import time
 import re
 
+from runtime_paths import bin_path, subprocess_text_kwargs
 from services import EngineRuntime, ProjectService
 
 
@@ -26,12 +28,114 @@ class ExportWorkflow:
         if state:
             self.project_service.update_step(state, "export", "failed")
 
-    def _mark_completed(self, state, output_path: str):
+    def _mark_completed(self, state, output_path: str, output_paths=None):
         if not state:
             return
         self.project_service.update_artifact(state, "final_video", output_path, save=False)
+        if output_paths and len(output_paths) > 1:
+            state.set_setting("export_mode", "split")
+            state.set_setting("export_output_paths", [str(path) for path in output_paths])
+        else:
+            state.settings.pop("export_mode", None)
+            state.settings.pop("export_output_paths", None)
         self.project_service.update_step(state, "export", "done", save=False)
         self.project_service.save_project(state)
+
+    def _probe_media_duration(self, media_path: str) -> float:
+        ffprobe = bin_path("ffmpeg", "ffprobe.exe")
+        if not os.path.exists(ffprobe):
+            raise FileNotFoundError(f"FFprobe not found at {ffprobe}")
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                media_path,
+            ],
+            capture_output=True,
+            check=False,
+            **subprocess_text_kwargs(),
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"Could not probe exported video duration: {detail[-500:]}")
+        try:
+            duration = float((result.stdout or "").strip())
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Could not read exported video duration.") from exc
+        if duration <= 0:
+            raise RuntimeError("Exported video has no usable duration.")
+        return duration
+
+    def _split_exported_video(self, output_path: str, split_count: int, on_progress=None) -> list[str]:
+        """Split a completed export into equally timed MP4 parts."""
+        try:
+            count = int(split_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Split count must be an integer.") from exc
+        if count < 2:
+            raise ValueError("Split count must be at least 2.")
+        if not output_path or not os.path.exists(output_path):
+            raise FileNotFoundError(f"Exported video not found: {output_path}")
+
+        ffmpeg = bin_path("ffmpeg", "ffmpeg.exe")
+        if not os.path.exists(ffmpeg):
+            raise FileNotFoundError(f"FFmpeg not found at {ffmpeg}")
+        duration = self._probe_media_duration(output_path)
+        stem, extension = os.path.splitext(output_path)
+        extension = extension or ".mp4"
+        parts: list[str] = []
+        try:
+            for index in range(count):
+                start = duration * index / count
+                end = duration * (index + 1) / count
+                part_path = f"{stem}_part_{index + 1:02d}{extension}"
+                self._emit_progress(
+                    on_progress,
+                    96 + int(index * 3 / count),
+                    f"Splitting export ({index + 1}/{count})...",
+                )
+                result = subprocess.run(
+                    [
+                        ffmpeg,
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel", "error",
+                        "-ss", f"{start:.6f}",
+                        "-i", output_path,
+                        "-t", f"{max(0.01, end - start):.6f}",
+                        "-map", "0:v:0",
+                        "-map", "0:a?",
+                        "-c", "copy",
+                        "-avoid_negative_ts", "make_zero",
+                        part_path,
+                    ],
+                    capture_output=True,
+                    check=False,
+                    **subprocess_text_kwargs(),
+                )
+                if result.returncode != 0 or not os.path.exists(part_path) or os.path.getsize(part_path) <= 0:
+                    detail = (result.stderr or result.stdout or "").strip()
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+                    raise RuntimeError(f"Could not create split part {index + 1}: {detail[-500:]}")
+                parts.append(part_path)
+        except Exception:
+            for part_path in parts:
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+            raise
+
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        return parts
 
     def _subtitle_options(self, subtitle_style):
         style = dict(subtitle_style or {})
@@ -584,8 +688,10 @@ class ExportWorkflow:
         original_audio_gain_db: float = 0.0,
         project_state_path: str = "",
         project_temp_dir: str = "",
+        export_mode: str = "full",
+        split_count: int = 1,
         on_progress=None,
-    ) -> str:
+    ) -> str | list[str]:
         subtitle_style = subtitle_style or {}
         target_w, target_h = self._resolve_target_dimensions(video_path, output_quality, output_ratio)
         target_fps = self._resolve_target_fps(output_fps)
@@ -757,9 +863,15 @@ class ExportWorkflow:
                 raise ValueError(f"Unsupported export mode: {mode}")
 
             self._emit_progress(on_progress, 95, "Finalizing exported video...")
-            self._mark_completed(state, output_path)
+            normalized_export_mode = str(export_mode or "full").strip().lower()
+            output_paths = [output_path]
+            if normalized_export_mode == "split":
+                output_paths = self._split_exported_video(output_path, split_count, on_progress)
+            elif normalized_export_mode != "full":
+                raise ValueError(f"Unsupported export mode: {export_mode}")
+            self._mark_completed(state, output_paths[0], output_paths=output_paths)
             self._emit_progress(on_progress, 100, "Export completed.")
-            return output_path
+            return output_paths if normalized_export_mode == "split" else output_path
         except Exception:
             self._mark_failed(state)
             raise

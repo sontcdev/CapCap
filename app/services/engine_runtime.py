@@ -215,12 +215,13 @@ class EngineRuntime:
             normalizer_dictionary=normalizer_dictionary,
         )
 
-    def build_voice_track(self, *, segments, tts_wav_paths, output_wav_path: str, gain_db: float = 0.0) -> str:
+    def build_voice_track(self, *, segments, tts_wav_paths, output_wav_path: str, gain_db: float = 0.0, timing_sync_mode: str = "smart") -> str:
         return self.audio_mix.build_voice_track(
             segments=segments,
             tts_wav_paths=tts_wav_paths,
             output_wav_path=output_wav_path,
             gain_db=gain_db,
+            timing_sync_mode=timing_sync_mode,
         )
 
     def fit_wav_to_duration(

@@ -2881,9 +2881,21 @@ class VideoTranslatorGUI(QMainWindow):
         return bool(getattr(self, "_mute_original_during_transcript", False))
 
     def _original_transcript_mute_ranges(self) -> list[tuple[float, float]]:
-        return normalize_transcript_mute_ranges(
-            list(getattr(self, "current_segments", None) or [])
-        )
+        candidates = []
+        cur = getattr(self, "current_segments", None)
+        if cur:
+            candidates.extend(cur)
+        trans = getattr(self, "current_translated_segments", None)
+        if trans:
+            candidates.extend(trans)
+        if hasattr(self, "get_active_segments"):
+            try:
+                active = self.get_active_segments()
+                if active and active is not cur and active is not trans:
+                    candidates.extend(active)
+            except Exception:
+                pass
+        return normalize_transcript_mute_ranges(candidates)
 
     def _original_transcript_mute_requested(self) -> bool:
         return bool(
@@ -3382,7 +3394,7 @@ class VideoTranslatorGUI(QMainWindow):
             processed_path = mute_audio_ranges(
                 raw_path,
                 sidecar_path,
-                list(getattr(self, "current_segments", None) or []),
+                ranges,
             )
             if not processed_path or os.path.abspath(processed_path) == os.path.abspath(raw_path):
                 return raw_path
@@ -12517,6 +12529,9 @@ class VideoTranslatorGUI(QMainWindow):
         # above is the source of truth for these project-only fields.
         self.refresh_detected_speakers_section()
         self._refresh_speaker_subtitle_colors_if_needed()
+        self._invalidate_original_audio_mute_cache(
+            refresh=self._mute_original_during_transcript_enabled()
+        )
         self.refresh_ui_state()
         QMessageBox.information(
             self,
@@ -13206,7 +13221,7 @@ class VideoTranslatorGUI(QMainWindow):
         if hasattr(self, "voice_timing_sync_combo") and hasattr(self, "voice_speed_spin"):
             mode = self.voice_timing_sync_combo.currentText().strip().lower()
             self.voice_speed_spin.setEnabled(mode != "off")
-        self.transcribe_btn.setEnabled(a_ok)
+        self.transcribe_btn.setEnabled(v_ok if self.get_transcription_engine() == "ocr" else a_ok)
         self.translate_btn.setEnabled(bool(self.transcript_text.toPlainText().strip()))
         self.apply_translated_btn.setEnabled(translation_ready and has_translated_text)
         if hasattr(self, "rewrite_translation_btn"):
@@ -15068,6 +15083,7 @@ class VideoTranslatorGUI(QMainWindow):
         self.last_styled_preview_path = ""
         self.last_styled_preview_signature = ""
         self.last_exported_video_path = ""
+        self.last_exported_video_paths = []
         self.last_exact_preview_5s_path = ""
         self.last_exact_preview_frame_path = ""
         self.live_preview_subtitle_path = ""

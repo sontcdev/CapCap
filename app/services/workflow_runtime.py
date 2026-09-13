@@ -114,8 +114,10 @@ class WorkflowRuntime:
         original_audio_gain_db: float = 0.0,
         project_state_path: str = "",
         project_temp_dir: str = "",
+        export_mode: str = "full",
+        split_count: int = 1,
         on_progress: callable = None,
-    ) -> str:
+    ) -> str | list[str]:
         return self.export_workflow.run(
             video_path=video_path,
             output_path=output_path,
@@ -134,6 +136,8 @@ class WorkflowRuntime:
             original_audio_gain_db=original_audio_gain_db,
             project_state_path=project_state_path,
             project_temp_dir=project_temp_dir,
+            export_mode=export_mode,
+            split_count=split_count,
             on_progress=on_progress,
         )
 

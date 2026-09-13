@@ -961,10 +961,11 @@ class VoiceWorkflow:
             actual_duration = self._probe_wav_duration_seconds(wav_path)
             ratio = (actual_duration / target_duration) if target_duration > 0 else 0.0
 
-            # SMART: trim trailing silence first so the duration
-            # estimate used by speed-adjustment heuristics is based
-            # on actual speech, not dead air.
-            if (sync_mode or "off").strip().lower() == "smart":
+            sync_key = (sync_mode or "off").strip().lower()
+            if sync_key == "smart":
+                # SMART: trim trailing silence first so the duration
+                # estimate used by speed-adjustment heuristics is based
+                # on actual speech, not dead air.
                 trimmed_path = os.path.join(tmp_dir, f"seg_{idx:04d}_silencetrim.wav")
                 trimmed = self.engine_runtime.trim_trailing_silence(
                     input_wav_path=polished_wavs[idx],
@@ -975,98 +976,46 @@ class VoiceWorkflow:
                     actual_duration = self._probe_wav_duration_seconds(trimmed)
                     ratio = (actual_duration / target_duration) if target_duration > 0 else 0.0
                     seg["_trimmed_silence"] = True
-            speech_cost = int(((seg.get("_tts_metrics") or {}).get("speech_cost")) or 0)
-            duration_sec = float(((seg.get("_tts_metrics") or {}).get("duration_sec")) or target_duration)
-            attempt_count = int((seg.get("attempt_count") or (seg.get("_tts_metrics") or {}).get("attempt_count") or 1))
 
-            if self._should_use_speedup_before_rewrite(
-                duration_sec=duration_sec,
-                speech_cost=speech_cost,
-                ratio=ratio,
-            ):
-                speed_ratio = min(1.15, max(1.0, ratio))
-                if abs(speed_ratio - 1.0) >= 0.02:
-                    adjusted_path = os.path.join(tmp_dir, f"seg_{idx:04d}_polish_speed.wav")
-                    wav_path = self.engine_runtime.change_wav_speed(
-                        input_wav_path=wav_path,
-                        output_wav_path=adjusted_path,
-                        speed_ratio=speed_ratio,
+                speech_cost = int(((seg.get("_tts_metrics") or {}).get("speech_cost")) or 0)
+                duration_sec = float(((seg.get("_tts_metrics") or {}).get("duration_sec")) or target_duration)
+
+                # Determine a single, non-compounding speedup (capped at safe speed <= 1.08x - 1.10x)
+                chosen_speed = 1.0
+                action_name = "accept"
+                if self._should_use_speedup_before_rewrite(
+                    duration_sec=duration_sec,
+                    speech_cost=speech_cost,
+                    ratio=ratio,
+                ):
+                    chosen_speed = min(1.08, max(1.0, ratio))
+                    action_name = "speed_light"
+                elif ratio > 1.15:
+                    rescue = self._segment_speed_ratio_for_outlier(
+                        duration_sec=duration_sec,
+                        speech_cost=speech_cost,
+                        ratio=ratio,
                     )
-                    polished_wavs[idx] = wav_path
-                    seg["action_taken"] = "speed_light"
+                    chosen_speed = min(1.10, max(1.0, rescue))
+                    action_name = "speed_rescue"
+                elif ratio > 1.08:
+                    medium = self._segment_speed_ratio_for_medium_overrun(ratio=ratio)
+                    chosen_speed = min(1.06, max(1.0, medium))
+                    action_name = "speed_balance"
+
+                if chosen_speed > 1.0 and abs(chosen_speed - 1.0) >= 0.02:
+                    adjusted_path = os.path.join(tmp_dir, f"seg_{idx:04d}_polish_speed.wav")
+                    polished_wavs[idx] = self.engine_runtime.change_wav_speed(
+                        input_wav_path=polished_wavs[idx],
+                        output_wav_path=adjusted_path,
+                        speed_ratio=chosen_speed,
+                    )
+                    seg["action_taken"] = action_name
                     metrics = dict(seg.get("_tts_metrics") or {})
-                    metrics["action_taken"] = "speed_light"
+                    metrics["action_taken"] = action_name
+                    metrics["speed_ratio"] = round(chosen_speed, 3)
                     seg["_tts_metrics"] = metrics
 
-            actual_duration = self._probe_wav_duration_seconds(polished_wavs[idx])
-            ratio = (actual_duration / target_duration) if target_duration > 0 else 0.0
-            stubborn_speed = self._segment_speed_ratio_for_stubborn_segment(
-                duration_sec=duration_sec,
-                speech_cost=speech_cost,
-                ratio=ratio,
-                attempt_count=attempt_count,
-                segment_index=idx,
-            )
-            if stubborn_speed > 1.0:
-                adjusted_path = os.path.join(tmp_dir, f"seg_{idx:04d}_stubborn_speed.wav")
-                polished_wavs[idx] = self.engine_runtime.change_wav_speed(
-                    input_wav_path=polished_wavs[idx],
-                    output_wav_path=adjusted_path,
-                    speed_ratio=stubborn_speed,
-                )
-                seg["action_taken"] = "speed_stubborn"
-                metrics = dict(seg.get("_tts_metrics") or {})
-                metrics["action_taken"] = "speed_stubborn"
-                metrics["stubborn_speed_ratio"] = round(stubborn_speed, 3)
-                seg["_tts_metrics"] = metrics
-
-            actual_duration = self._probe_wav_duration_seconds(polished_wavs[idx])
-            ratio = (actual_duration / target_duration) if target_duration > 0 else 0.0
-            rescue_speed = self._segment_speed_ratio_for_outlier(
-                duration_sec=duration_sec,
-                speech_cost=speech_cost,
-                ratio=ratio,
-            )
-            if rescue_speed > 1.0 and ratio > 1.15:
-                adjusted_path = os.path.join(tmp_dir, f"seg_{idx:04d}_rescue_speed.wav")
-                polished_wavs[idx] = self.engine_runtime.change_wav_speed(
-                    input_wav_path=polished_wavs[idx],
-                    output_wav_path=adjusted_path,
-                    speed_ratio=rescue_speed,
-                )
-                seg["action_taken"] = "speed_rescue"
-                metrics = dict(seg.get("_tts_metrics") or {})
-                metrics["action_taken"] = "speed_rescue"
-                metrics["rescue_speed_ratio"] = round(rescue_speed, 3)
-                seg["_tts_metrics"] = metrics
-
-            actual_duration = self._probe_wav_duration_seconds(polished_wavs[idx])
-            ratio = (actual_duration / target_duration) if target_duration > 0 else 0.0
-            medium_speed = self._segment_speed_ratio_for_medium_overrun(ratio=ratio)
-            if medium_speed > 1.0:
-                adjusted_path = os.path.join(tmp_dir, f"seg_{idx:04d}_medium_speed.wav")
-                polished_wavs[idx] = self.engine_runtime.change_wav_speed(
-                    input_wav_path=polished_wavs[idx],
-                    output_wav_path=adjusted_path,
-                    speed_ratio=medium_speed,
-                )
-                seg["action_taken"] = "speed_balance"
-                metrics = dict(seg.get("_tts_metrics") or {})
-                metrics["action_taken"] = "speed_balance"
-                metrics["balance_speed_ratio"] = round(medium_speed, 3)
-                seg["_tts_metrics"] = metrics
-
-            if (sync_mode or "off").strip().lower() == "smart":
-                actual_duration = self._probe_wav_duration_seconds(polished_wavs[idx])
-                ratio = (actual_duration / target_duration) if target_duration > 0 else 0.0
-                if self._should_allow_post_rewrite_speedup(ratio=ratio):
-                    synced_path = os.path.join(tmp_dir, f"seg_{idx:04d}_smartfit.wav")
-                    polished_wavs[idx] = self.engine_runtime.fit_wav_to_duration(
-                        input_wav_path=polished_wavs[idx],
-                        output_wav_path=synced_path,
-                        target_duration_seconds=target_duration,
-                        mode="smart",
-                    )
             if (sync_mode or "off").strip().lower() in ("timeline", "timeline priority"):
                 extended_duration = target_duration
                 if idx + 1 < len(segments):
@@ -1234,8 +1183,17 @@ class VoiceWorkflow:
         manifest_by_cache_key = dict(manifest.get("by_cache_key", {}) or {})
         normalizer_signature = self._normalizer_signature(normalizer_dictionary)
         wavs = [""] * len(segments)
-        pending_jobs = []
+        pending_jobs_by_key = {}
+        pending_indices_by_key = {}
         cache_hits = 0
+
+        # Build reverse index for legacy cache conflict detection:
+        # wav_path -> set of cache_keys claiming that path
+        path_to_keys = {}
+        for k, v in manifest_by_cache_key.items():
+            wp = str(v.get("wav_path", "")).strip()
+            if wp:
+                path_to_keys.setdefault(wp, set()).add(k)
 
         for idx, seg in enumerate(segments):
             global_idx = int(index_offset) + idx
@@ -1244,21 +1202,33 @@ class VoiceWorkflow:
                 wavs[idx] = ""
                 continue
             segment_voice_name = str(seg.get("voice_name") or voice_name).strip() or voice_name
-            seg_wav = os.path.join(tmp_dir, f"seg_{global_idx:04d}_base.wav")
             cache_key = self._segment_cache_key(
                 text=txt,
                 voice_name=segment_voice_name,
                 provider_speed=provider_speed,
                 normalizer_signature=normalizer_signature,
             )
-            cache_entry = manifest_segments.get(str(global_idx), {})
-            cached_wav = str(cache_entry.get("wav_path", "")).strip()
-            cached_key = str(cache_entry.get("cache_key", "")).strip()
-            if not (cached_key == cache_key and cached_wav and os.path.exists(cached_wav)):
+            # Content-addressed target path: immune to index shifts and cue additions/deletions
+            seg_wav = os.path.join(tmp_dir, f"tts_{cache_key[:16]}_base.wav")
+
+            # 1. Direct hit on content-addressed file
+            cached_wav = ""
+            if os.path.exists(seg_wav):
+                cached_wav = seg_wav
+            else:
+                # 2. Check manifest by cache key
                 cache_entry = dict(manifest_by_cache_key.get(cache_key, {}) or {})
-                cached_wav = str(cache_entry.get("wav_path", "")).strip()
-                cached_key = str(cache_entry.get("cache_key", "")).strip()
-            if cached_key == cache_key and cached_wav and os.path.exists(cached_wav):
+                candidate = str(cache_entry.get("wav_path", "")).strip()
+                if candidate and os.path.exists(candidate) and str(cache_entry.get("cache_key", "")) == cache_key:
+                    # If it's a legacy seg_XXXX file, ensure no other cache_key with different text claimed it
+                    if not os.path.basename(candidate).startswith("tts_"):
+                        claiming_keys = path_to_keys.get(candidate, set())
+                        if len(claiming_keys) <= 1:
+                            cached_wav = candidate
+                    else:
+                        cached_wav = candidate
+
+            if cached_wav:
                 wavs[idx] = cached_wav
                 manifest_segments[str(global_idx)] = {
                     "cache_key": cache_key,
@@ -1271,16 +1241,21 @@ class VoiceWorkflow:
                 manifest_by_cache_key[cache_key] = dict(manifest_segments[str(global_idx)])
                 cache_hits += 1
                 continue
-            pending_jobs.append(
-                {
-                    "idx": idx,
-                    "global_idx": global_idx,
+
+            # Need synthesis: deduplicate by cache_key so identical segments in the same batch
+            # share a single job and don't race to write the same file
+            if cache_key in pending_jobs_by_key:
+                pending_indices_by_key[cache_key].append((idx, global_idx))
+            else:
+                pending_jobs_by_key[cache_key] = {
                     "text": txt,
                     "wav_path": seg_wav,
                     "cache_key": cache_key,
                     "voice_name": segment_voice_name,
                 }
-            )
+                pending_indices_by_key[cache_key] = [(idx, global_idx)]
+
+        pending_jobs = list(pending_jobs_by_key.values())
 
         if pending_jobs:
             pending_providers = {self._voice_provider(str(job["voice_name"])) for job in pending_jobs}
@@ -1294,27 +1269,31 @@ class VoiceWorkflow:
                 worker_count = max(1, min(4, long_project_workers, len(pending_jobs), cpu_limit))
                 try:
                     # Warm Piper once before parallel synthesis so the UI does not appear frozen during first-load.
+                    warm_job = pending_jobs[0]
                     self.engine_runtime.synthesize_segment(
-                        text=pending_jobs[0]["text"],
-                        wav_path=pending_jobs[0]["wav_path"],
-                        voice=pending_jobs[0]["voice_name"],
+                        text=warm_job["text"],
+                        wav_path=warm_job["wav_path"],
+                        voice=warm_job["voice_name"],
                         speed=provider_speed,
                         tmp_dir=tmp_dir,
                         on_progress=on_progress,
                         normalizer_dictionary=normalizer_dictionary,
                     )
-                    manifest_segments[str(pending_jobs[0]["global_idx"])] = {
-                        "cache_key": str(pending_jobs[0]["cache_key"]),
-                        "wav_path": str(pending_jobs[0]["wav_path"]),
-                        "text": str(pending_jobs[0]["text"]),
-                        "voice_name": pending_jobs[0]["voice_name"],
+                    warm_key = str(warm_job["cache_key"])
+                    warm_entry = {
+                        "cache_key": warm_key,
+                        "wav_path": str(warm_job["wav_path"]),
+                        "text": str(warm_job["text"]),
+                        "voice_name": warm_job["voice_name"],
                         "provider_speed": provider_speed,
                         "normalizer_signature": normalizer_signature,
                     }
-                    manifest_by_cache_key[str(pending_jobs[0]["cache_key"])] = dict(manifest_segments[str(pending_jobs[0]["global_idx"])])
-                    wavs[int(pending_jobs[0]["idx"])] = str(pending_jobs[0]["wav_path"])
+                    for i_idx, g_idx in pending_indices_by_key.get(warm_key, []):
+                        wavs[i_idx] = str(warm_job["wav_path"])
+                        manifest_segments[str(g_idx)] = warm_entry
+                    manifest_by_cache_key[warm_key] = warm_entry
                     pending_jobs = pending_jobs[1:]
-                    cache_hits += 1
+                    cache_hits += len(pending_indices_by_key.get(warm_key, []))
                 except Exception:
                     pass
             elif pending_providers == {"edge"}:
@@ -1350,9 +1329,9 @@ class VoiceWorkflow:
                 completed_count = 0
                 for future in as_completed(future_map):
                     job = future_map[future]
-                    idx = int(job["idx"])
                     txt = str(job["text"])
                     seg_wav = str(job["wav_path"])
+                    j_key = str(job["cache_key"])
                     try:
                         future.result()
                         completed_count += 1
@@ -1361,26 +1340,29 @@ class VoiceWorkflow:
                         if len(preview) > 120:
                             preview = preview[:117] + "..."
                         if on_progress:
-                            on_progress(f"[TTS Warning] Segment {idx + 1} failed, using silence placeholder.")
+                            on_progress(f"[TTS Warning] Synthesis failed, using silence placeholder.")
+                        first_i = pending_indices_by_key.get(j_key, [(0, 0)])[0][0]
                         target_duration = max(
                             0.2,
-                            float(segments[idx].get("end", 0.0)) - float(segments[idx].get("start", 0.0)),
+                            float(segments[first_i].get("end", 0.0)) - float(segments[first_i].get("start", 0.0)),
                         )
                         self._write_silence_wav(seg_wav, target_duration)
                         print(
-                            f"[Voice Workflow] TTS failed at subtitle segment {idx + 1}: "
+                            f"[Voice Workflow] TTS failed: "
                             f"\"{preview}\". Using silence placeholder. Error: {exc}"
                         )
-                    manifest_segments[str(job["global_idx"])] = {
-                        "cache_key": str(job["cache_key"]),
+                    job_entry = {
+                        "cache_key": j_key,
                         "wav_path": seg_wav,
                         "text": txt,
                         "voice_name": job["voice_name"],
                         "provider_speed": provider_speed,
                         "normalizer_signature": normalizer_signature,
                     }
-                    manifest_by_cache_key[str(job["cache_key"])] = dict(manifest_segments[str(job["global_idx"])])
-                    wavs[idx] = seg_wav
+                    for i_idx, g_idx in pending_indices_by_key.get(j_key, []):
+                        wavs[i_idx] = seg_wav
+                        manifest_segments[str(g_idx)] = job_entry
+                    manifest_by_cache_key[j_key] = job_entry
         elif log:
             print(f"[Voice Workflow] TTS synth jobs: pending=0, cache_hits={cache_hits}, workers=0, native_speed={provider_speed:.2f}")
 
@@ -1543,6 +1525,7 @@ class VoiceWorkflow:
             tts_wav_paths=wavs,
             output_wav_path=voice_track,
             gain_db=0.0,
+            timing_sync_mode=timing_sync_mode,
         )
         build_elapsed = time.perf_counter() - build_started
 

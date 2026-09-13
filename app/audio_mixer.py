@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import wave
+import struct
 
 from runtime_paths import bin_path, subprocess_text_kwargs
 
@@ -108,7 +109,8 @@ def fit_wav_to_duration(
     if mode_key == "timeline":
         if fit_ratio >= 1.0 or abs(fit_ratio - 1.0) < 0.02:
             return input_wav_path
-        filter_chain = _build_atempo_filter(1.0 / fit_ratio)
+        speed_factor = min(1.12, 1.0 / fit_ratio)
+        filter_chain = _build_atempo_filter(speed_factor)
         cmd = [
             ffmpeg, "-y", "-i", input_wav_path,
             "-filter:a", filter_chain,
@@ -116,29 +118,29 @@ def fit_wav_to_duration(
             output_wav_path,
         ]
     elif mode_key == "smart":
-        # Smart mode: when the audio is too long, TRIM (cut) it to
-        # match the target duration instead of speeding it up. When it's
-        # too short, stretch (atempo) up to the safe range.
+        # Smart mode: when the audio is too long (fit_ratio < 1.0, meaning source_duration > target_duration),
+        # TRIM (cut) it to match the target duration instead of speeding it up.
+        # When it's too short (fit_ratio > 1.0), stretch (atempo) up to the safe range.
         if abs(fit_ratio - 1.0) < 0.02:
             return input_wav_path
         if fit_ratio < 1.0:
-            # Audio shorter than target — stretch to fit.
-            if fit_ratio < smart_min_ratio:
-                return input_wav_path
-            atempo_ratio = 1.0 / fit_ratio
-            filter_chain = _build_atempo_filter(atempo_ratio)
-            cmd = [
-                ffmpeg, "-y", "-i", input_wav_path,
-                "-filter:a", filter_chain,
-                "-ar", "16000", "-ac", "1",
-                output_wav_path,
-            ]
-        else:
             # Audio longer than target — TRIM (cut) to fit, no speed
             # change. Use ffmpeg's `-t` flag to set the output duration.
             cmd = [
                 ffmpeg, "-y", "-i", input_wav_path,
                 "-t", str(target_duration),
+                "-ar", "16000", "-ac", "1",
+                output_wav_path,
+            ]
+        else:
+            # Audio shorter than target — stretch (slow down) to fit if within safe range.
+            atempo_ratio = 1.0 / fit_ratio
+            if atempo_ratio < smart_min_ratio:
+                return input_wav_path
+            filter_chain = _build_atempo_filter(atempo_ratio)
+            cmd = [
+                ffmpeg, "-y", "-i", input_wav_path,
+                "-filter:a", filter_chain,
                 "-ar", "16000", "-ac", "1",
                 output_wav_path,
             ]
@@ -299,12 +301,19 @@ def normalize_transcript_mute_ranges(
     transcript_ranges: list | None,
     *,
     duration_seconds: float | None = None,
+    merge_gap_threshold: float = 0.25,
 ) -> list[tuple[float, float]]:
     """Return sorted, merged ranges for hard-muting original audio.
 
-    Only non-empty transcript segments with finite timestamps are accepted.
-    Negative timestamps are clamped to zero and, when the source duration is
-    known, timestamps past the end of the source are clamped to that duration.
+    Accepts (start, end) tuples, Segment models, or segment dictionaries with
+    text stored under standard keys (text, original_text, final_text, tts_text,
+    dubbing_vi, subtitle_vi, raw_translation). Only non-empty cues with finite
+    timestamps are accepted. Negative timestamps are clamped to zero and, when
+    the source duration is known, clamped to duration.
+
+    Gaps shorter than ``merge_gap_threshold`` seconds (default 250ms) between
+    adjacent speech cues are bridged to avoid choppy micro-unmuting between
+    connected dialogue phrases, while keeping all musical and scene pauses unmuted.
     """
     duration = None
     try:
@@ -314,18 +323,58 @@ def normalize_transcript_mute_ranges(
     except (TypeError, ValueError):
         pass
 
+    try:
+        gap_threshold = max(0.0, float(merge_gap_threshold or 0.0))
+    except (TypeError, ValueError):
+        gap_threshold = 0.25
+
     ranges: list[tuple[float, float]] = []
     for segment in transcript_ranges or []:
-        if not isinstance(segment, dict):
+        start = None
+        end = None
+        if isinstance(segment, (tuple, list)) and len(segment) >= 2:
+            try:
+                start = float(segment[0])
+                end = float(segment[1])
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(segment, dict):
+            text = str(
+                segment.get("text")
+                or segment.get("original_text")
+                or segment.get("final_text")
+                or segment.get("tts_text")
+                or segment.get("subtitle_vi")
+                or segment.get("dubbing_vi")
+                or segment.get("raw_translation")
+                or ""
+            ).strip()
+            if not text:
+                continue
+            try:
+                start = float(segment.get("start"))
+                end = float(segment.get("end"))
+            except (TypeError, ValueError):
+                continue
+        elif hasattr(segment, "start") and hasattr(segment, "end"):
+            text = str(
+                getattr(segment, "subtitle_text", "")
+                or getattr(segment, "original_text", "")
+                or getattr(segment, "final_text", "")
+                or getattr(segment, "text", "")
+                or ""
+            ).strip()
+            if not text:
+                continue
+            try:
+                start = float(segment.start)
+                end = float(segment.end)
+            except (TypeError, ValueError):
+                continue
+        else:
             continue
-        if not str(segment.get("text", "") or "").strip():
-            continue
-        try:
-            start = float(segment.get("start"))
-            end = float(segment.get("end"))
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(start) or not math.isfinite(end):
+
+        if start is None or end is None or not math.isfinite(start) or not math.isfinite(end):
             continue
         start = max(0.0, start)
         end = max(0.0, end)
@@ -342,7 +391,7 @@ def normalize_transcript_mute_ranges(
     merged: list[tuple[float, float]] = [ranges[0]]
     for start, end in ranges[1:]:
         previous_start, previous_end = merged[-1]
-        if start <= previous_end:
+        if start <= previous_end + gap_threshold:
             merged[-1] = (previous_start, max(previous_end, end))
         else:
             merged.append((start, end))
@@ -364,24 +413,57 @@ def _mute_wav_file(
         params = source.getparams()
         frame_rate = int(source.getframerate() or 0)
         frame_count = int(source.getnframes() or 0)
-        frame_width = int(source.getnchannels() or 0) * int(source.getsampwidth() or 0)
+        nchannels = int(source.getnchannels() or 0)
+        sampwidth = int(source.getsampwidth() or 0)
+        frame_width = nchannels * sampwidth
         raw = bytearray(source.readframes(frame_count))
 
     if frame_rate <= 0 or frame_count <= 0 or frame_width <= 0:
         return input_audio_path
 
-    silence_sample = b"\x80" if params.sampwidth == 1 else b"\x00"
-    silence_frame = silence_sample * int(params.nchannels) * int(params.sampwidth)
+    silence_sample = b"\x80" if sampwidth == 1 else b"\x00"
+    silence_frame = silence_sample * nchannels * sampwidth
     if not silence_frame:
         return input_audio_path
+
+    # 10ms smooth linear ramp at boundaries to eliminate DC-offset pops
+    fade_frames = max(1, min(int(0.010 * frame_rate), 480))
+
     for start, end in ranges:
         first_frame = max(0, min(frame_count, int(math.floor(start * frame_rate))))
         last_frame = max(0, min(frame_count, int(math.ceil(end * frame_rate))))
         if last_frame <= first_frame:
             continue
-        first_byte = first_frame * frame_width
-        last_byte = last_frame * frame_width
-        raw[first_byte:last_byte] = silence_frame * (last_frame - first_frame)
+
+        actual_fade = min(fade_frames, (last_frame - first_frame) // 2)
+
+        if sampwidth == 2 and actual_fade > 0:
+            for f in range(actual_fade):
+                gain = 1.0 - (f + 1) / (actual_fade + 1)
+                offset = (first_frame + f) * frame_width
+                for ch in range(nchannels):
+                    co = offset + ch * 2
+                    val = struct.unpack_from("<h", raw, co)[0]
+                    struct.pack_into("<h", raw, co, int(round(val * gain)))
+            first_zero = first_frame + actual_fade
+
+            fade_end = last_frame - actual_fade
+            for f in range(actual_fade):
+                gain = (f + 1) / (actual_fade + 1)
+                offset = (fade_end + f) * frame_width
+                for ch in range(nchannels):
+                    co = offset + ch * 2
+                    val = struct.unpack_from("<h", raw, co)[0]
+                    struct.pack_into("<h", raw, co, int(round(val * gain)))
+            last_zero = fade_end
+        else:
+            first_zero = first_frame
+            last_zero = last_frame
+
+        if last_zero > first_zero:
+            first_byte = first_zero * frame_width
+            last_byte = last_zero * frame_width
+            raw[first_byte:last_byte] = silence_frame * (last_zero - first_zero)
 
     output_dir = os.path.dirname(os.path.abspath(output_audio_path)) or "."
     os.makedirs(output_dir, exist_ok=True)
@@ -420,19 +502,49 @@ def _mute_decoded_audio_file(
 
     raw = bytearray(audio.raw_data)
     frame_width = int(audio.frame_width)
-    # pydub exposes decoded raw PCM as signed samples, including 8-bit audio.
-    # The WAV writer below handles the unsigned 8-bit representation itself.
+    nchannels = int(audio.channels)
+    sample_width = int(audio.sample_width)
     silence_sample = b"\x00"
-    silence_frame = silence_sample * int(audio.channels) * int(audio.sample_width)
+    silence_frame = silence_sample * nchannels * sample_width
     frame_count = len(raw) // frame_width
+
+    fade_frames = max(1, min(int(0.010 * frame_rate), 480))
+
     for start, end in ranges:
         first_frame = max(0, min(frame_count, int(math.floor(start * frame_rate))))
         last_frame = max(0, min(frame_count, int(math.ceil(end * frame_rate))))
         if last_frame <= first_frame:
             continue
-        first_byte = first_frame * frame_width
-        last_byte = last_frame * frame_width
-        raw[first_byte:last_byte] = silence_frame * (last_frame - first_frame)
+
+        actual_fade = min(fade_frames, (last_frame - first_frame) // 2)
+
+        if sample_width == 2 and actual_fade > 0:
+            for f in range(actual_fade):
+                gain = 1.0 - (f + 1) / (actual_fade + 1)
+                offset = (first_frame + f) * frame_width
+                for ch in range(nchannels):
+                    co = offset + ch * 2
+                    val = struct.unpack_from("<h", raw, co)[0]
+                    struct.pack_into("<h", raw, co, int(round(val * gain)))
+            first_zero = first_frame + actual_fade
+
+            fade_end = last_frame - actual_fade
+            for f in range(actual_fade):
+                gain = (f + 1) / (actual_fade + 1)
+                offset = (fade_end + f) * frame_width
+                for ch in range(nchannels):
+                    co = offset + ch * 2
+                    val = struct.unpack_from("<h", raw, co)[0]
+                    struct.pack_into("<h", raw, co, int(round(val * gain)))
+            last_zero = fade_end
+        else:
+            first_zero = first_frame
+            last_zero = last_frame
+
+        if last_zero > first_zero:
+            first_byte = first_zero * frame_width
+            last_byte = last_zero * frame_width
+            raw[first_byte:last_byte] = silence_frame * (last_zero - first_zero)
 
     muted = AudioSegment(
         data=bytes(raw),
@@ -490,7 +602,7 @@ def mute_audio_ranges(
     try:
         return _mute_wav_file(input_audio_path, output_audio_path, ranges)
     except (wave.Error, EOFError, OSError):
-        return _mute_decoded_audio_file(input_audio_path, output_audio_path, transcript_ranges)
+        return _mute_decoded_audio_file(input_audio_path, output_audio_path, ranges)
 
 
 def _merge_ducking_ranges(
@@ -562,6 +674,7 @@ def build_voice_track_from_srt_segments(
     output_wav_path: str,
     total_duration_ms: int | None = None,
     gain_db: float = 0.0,
+    timing_sync_mode: str = "smart",
 ) -> str:
     """
     Build a single voice track by overlaying each segment wav at its start time.
@@ -619,21 +732,40 @@ def build_voice_track_from_srt_segments(
                     if silent_ms > 0:
                         clip = clip + AudioSegment.silent(duration=silent_ms, frame_rate=16000)
             elif clip_len > max_len:
-                fit_dir = tempfile.mkdtemp(prefix="capcap_voice_fit_")
-                fit_path = os.path.join(fit_dir, f"segment_{idx:04d}.wav")
-                try:
-                    fitted_path = fit_wav_to_duration(
-                        input_wav_path=wav_path,
-                        output_wav_path=fit_path,
-                        target_duration_seconds=max_len / 1000.0,
-                        mode="force",
-                    )
-                    if fitted_path != wav_path and os.path.exists(fitted_path):
-                        clip = AudioSegment.from_file(fitted_path)
-                except (FileNotFoundError, OSError, RuntimeError):
-                    pass
-                finally:
-                    shutil.rmtree(fit_dir, ignore_errors=True)
+                sync_key = (timing_sync_mode or "smart").strip().lower()
+                if sync_key in ("force", "force fit"):
+                    fit_dir = tempfile.mkdtemp(prefix="capcap_voice_fit_")
+                    fit_path = os.path.join(fit_dir, f"segment_{idx:04d}.wav")
+                    try:
+                        fitted_path = fit_wav_to_duration(
+                            input_wav_path=wav_path,
+                            output_wav_path=fit_path,
+                            target_duration_seconds=max_len / 1000.0,
+                            mode="force",
+                        )
+                        if fitted_path != wav_path and os.path.exists(fitted_path):
+                            clip = AudioSegment.from_file(fitted_path)
+                    except (FileNotFoundError, OSError, RuntimeError):
+                        pass
+                    finally:
+                        shutil.rmtree(fit_dir, ignore_errors=True)
+                elif sync_key in ("smart", "timeline", "timeline priority") and clip_len <= max_len * 1.08:
+                    fit_dir = tempfile.mkdtemp(prefix="capcap_voice_fit_")
+                    fit_path = os.path.join(fit_dir, f"segment_{idx:04d}.wav")
+                    try:
+                        fitted_path = fit_wav_to_duration(
+                            input_wav_path=wav_path,
+                            output_wav_path=fit_path,
+                            target_duration_seconds=max_len / 1000.0,
+                            mode="force",
+                        )
+                        if fitted_path != wav_path and os.path.exists(fitted_path):
+                            clip = AudioSegment.from_file(fitted_path)
+                    except (FileNotFoundError, OSError, RuntimeError):
+                        pass
+                    finally:
+                        shutil.rmtree(fit_dir, ignore_errors=True)
+
                 if len(clip) > max_len:
                     clip = clip[:max_len]
                 fade_ms = min(len(clip), 50)

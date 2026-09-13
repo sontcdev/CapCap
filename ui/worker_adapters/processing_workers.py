@@ -913,31 +913,34 @@ class SegmentAudioPreviewWorker(QThread):
             )
             residual_speed = (requested_speed / provider_speed) if provider_speed > 0.0 else requested_speed
 
-            base_wav_path = os.path.join(cache_temp_dir, f"seg_{self.index:04d}_base.wav")
-            engine.synthesize_segment(
-                text=self.text,
-                wav_path=base_wav_path,
-                voice=self.voice_name,
-                speed=provider_speed,
-                tmp_dir=cache_temp_dir,
-                normalizer_dictionary=self.normalizer_dictionary,
-            )
-
-            manifest = load_manifest(cache_temp_dir)
-            manifest_segments = dict(manifest.get("segments", {}) or {})
-            manifest_by_cache_key = dict(manifest.get("by_cache_key", {}) or {})
+            normalizer_sig = _normalizer_signature(self.normalizer_dictionary)
             cache_key = segment_cache_key(
                 text=self.text,
                 voice_name=self.voice_name,
                 provider_speed=provider_speed,
-                normalizer_signature=_normalizer_signature(self.normalizer_dictionary),
+                normalizer_signature=normalizer_sig,
             )
+            base_wav_path = os.path.join(cache_temp_dir, f"tts_{cache_key[:16]}_base.wav")
+            if not os.path.exists(base_wav_path):
+                engine.synthesize_segment(
+                    text=self.text,
+                    wav_path=base_wav_path,
+                    voice=self.voice_name,
+                    speed=provider_speed,
+                    tmp_dir=cache_temp_dir,
+                    normalizer_dictionary=self.normalizer_dictionary,
+                )
+
+            manifest = load_manifest(cache_temp_dir)
+            manifest_segments = dict(manifest.get("segments", {}) or {})
+            manifest_by_cache_key = dict(manifest.get("by_cache_key", {}) or {})
             manifest_entry = {
                 "cache_key": cache_key,
                 "wav_path": base_wav_path,
                 "text": self.text,
                 "voice_name": self.voice_name,
                 "provider_speed": provider_speed,
+                "normalizer_signature": normalizer_sig,
             }
             manifest_segments[str(self.index)] = manifest_entry
             manifest_by_cache_key[cache_key] = dict(manifest_entry)

@@ -402,6 +402,8 @@ class CapCapRemoteHandler(BaseHTTPRequestHandler):
             original_audio_gain_db=float(payload.get("original_audio_gain_db", 0.0) or 0.0),
             project_state_path=str(payload.get("project_state_path", "") or ""),
             project_temp_dir=str(payload.get("project_temp_dir", "") or ""),
+            export_mode=str(payload.get("export_mode", "full") or "full"),
+            split_count=int(payload.get("split_count", 1) or 1),
         )
         return {"ok": True, "output_path": output}
 

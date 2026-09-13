@@ -410,6 +410,7 @@ def _initialize_ui_state(gui):
     gui.last_styled_preview_path = ""
     gui.last_styled_preview_signature = ""
     gui.last_exported_video_path = ""
+    gui.last_exported_video_paths = []
     gui.last_exact_preview_5s_path = ""
     gui.last_exact_preview_frame_path = ""
     gui._preview_video_has_burned_subtitles = False

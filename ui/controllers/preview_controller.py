@@ -8,7 +8,16 @@ import time
 
 from PySide6.QtCore import QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QLabel,
+    QMessageBox,
+    QSpinBox,
+)
 
 from runtime_paths import bin_path
 from worker_adapters import ExactFramePreviewWorker, FinalExportWorker, PreviewMuxWorker, QuickPreviewWorker
@@ -583,7 +592,39 @@ class PreviewController:
             return None, None
         return target_w, target_h
 
-    def _confirm_export_summary(self, *, video_path: str, output_path: str, mode: str, audio_path: str):
+    def _choose_export_mode(self):
+        dialog = QDialog(self.gui)
+        dialog.setWindowTitle("Export Options")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(420)
+
+        layout = QFormLayout(dialog)
+        mode_combo = QComboBox(dialog)
+        mode_combo.addItem("Full video", "full")
+        mode_combo.addItem("Split into parts", "split")
+        split_count = QSpinBox(dialog)
+        split_count.setRange(2, 100)
+        split_count.setValue(2)
+        split_count.setEnabled(False)
+        helper = QLabel("Split creates equally timed MP4 files next to the selected output name.", dialog)
+        helper.setWordWrap(True)
+
+        mode_combo.currentIndexChanged.connect(lambda index: split_count.setEnabled(index == 1))
+        layout.addRow("Export type", mode_combo)
+        layout.addRow("Number of parts", split_count)
+        layout.addRow("", helper)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow("", buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        selected_mode = str(mode_combo.currentData() or "full")
+        return selected_mode, (int(split_count.value()) if selected_mode == "split" else 1)
+
+    def _confirm_export_summary(self, *, video_path: str, output_path: str, mode: str, audio_path: str, export_mode: str = "full", split_count: int = 1):
         output_quality = self.gui.get_output_quality_key()
         output_fps = self.gui.get_output_fps_key()
         source_fps = self._probe_source_fps(video_path)
@@ -639,6 +680,7 @@ class PreviewController:
         summary_lines = [
             f"Name: {os.path.basename(output_path)}",
             f"Folder: {os.path.dirname(output_path)}",
+            f"Export: {'Split into ' + str(split_count) + ' parts' if str(export_mode).lower() == 'split' else 'Full video'}",
             f"Mode: {mode_label}",
             f"Duration: {self._format_duration_ms(duration_ms)}",
             "",
@@ -667,6 +709,9 @@ class PreviewController:
             f"Subtitles: {'Yes' if has_subtitles else 'No'}",
             f"Layers: {self._active_export_layer_summary()}",
         ])
+        if str(export_mode).lower() == "split":
+            output_stem = os.path.splitext(os.path.basename(output_path))[0]
+            summary_lines.insert(4, f"Files: {output_stem}_part_01.mp4 ... {output_stem}_part_{int(split_count):02d}.mp4")
 
         box = QMessageBox(self.gui)
         box.setIcon(QMessageBox.Information)
@@ -919,6 +964,15 @@ class PreviewController:
             QMessageBox.warning(self.gui, "Error", "Please choose a video first.")
             return
 
+        # Let the user choose the output shape immediately after clicking
+        # Export.  The save-file dialog used to appear first, which made the
+        # Full/Split choice easy to miss and looked like an unconditional
+        # single-file export.
+        export_choice = self._choose_export_mode()
+        if not export_choice:
+            return
+        export_mode, split_count = export_choice
+
         mode = self._effective_render_mode_without_tts(self.gui.get_output_mode_key())
         original_audio_gain_db = self._original_audio_gain_db_for_render(mode)
         video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -1000,6 +1054,8 @@ class PreviewController:
             output_path=output_path,
             mode=mode,
             audio_path=chosen_audio,
+            export_mode=export_mode,
+            split_count=split_count,
         ):
             return
 
@@ -1041,6 +1097,8 @@ class PreviewController:
             original_audio_gain_db=original_audio_gain_db,
             project_state_path=project_state_path,
             project_temp_dir=self.gui.get_project_temp_dir("export"),
+            export_mode=export_mode,
+            split_count=split_count,
         )
         self.gui.export_thread.progress.connect(self.gui.on_export_progress)
         self.gui.export_thread.finished.connect(self.gui.on_export_finished)
@@ -1323,14 +1381,27 @@ class PreviewController:
             self.gui.show_error("Error", "Final export failed.", error)
             return
 
-        if output_path and os.path.exists(output_path):
-            self.gui.last_exported_video_path = output_path
-            self.gui.processed_artifacts["final_video"] = output_path
-            self.gui.update_project_artifact("final_video", output_path)
+        if isinstance(output_path, (list, tuple)):
+            output_paths = [str(path) for path in output_path if str(path or "").strip()]
+        else:
+            output_paths = [str(output_path)] if str(output_path or "").strip() else []
+        output_paths = [path for path in output_paths if os.path.exists(path)]
+        if output_paths:
+            primary_output = output_paths[0]
+            self.gui.last_exported_video_path = primary_output
+            self.gui.last_exported_video_paths = output_paths
+            self.gui.processed_artifacts["final_video"] = primary_output
+            self.gui.processed_artifacts["final_videos"] = output_paths
+            self.gui.update_project_artifact("final_video", primary_output)
             self.gui.update_project_step("export", "done")
             self.gui.sync_preview_audio_track_to_output(apply_to_player=False)
             self.gui.update_workflow_stage_badges()
-            self.gui.log(f"[Export] Final video exported successfully: {output_path}")
+            if len(output_paths) == 1:
+                self.gui.log(f"[Export] Final video exported successfully: {primary_output}")
+            else:
+                self.gui.log(f"[Export] Split export created {len(output_paths)} files:")
+                for path in output_paths:
+                    self.gui.log(f"[Export]   {path}")
             self.gui.log("[Export] Kept current preview/subtitle state so you can continue editing after export.")
 
     def on_quick_preview_ready(self, output_path, error):

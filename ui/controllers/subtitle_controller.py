@@ -125,6 +125,10 @@ class SubtitleController:
             self.gui.persist_transcription_project_data(segments)
             QMessageBox.information(self.gui, "Success", "Transcription completed!")
 
+        if hasattr(self.gui, "_invalidate_original_audio_mute_cache"):
+            self.gui._invalidate_original_audio_mute_cache(
+                refresh=self.gui._mute_original_during_transcript_enabled()
+            )
         self.gui.refresh_ui_state()
         self.gui.schedule_auto_frame_preview()
         # The OCR crop is only an editor aid. Do not leave it covering the
@@ -235,6 +239,10 @@ class SubtitleController:
         if fallback_notice:
             self.gui.log(f"[Translation] {fallback_notice}")
 
+        if hasattr(self.gui, "_invalidate_original_audio_mute_cache"):
+            self.gui._invalidate_original_audio_mute_cache(
+                refresh=self.gui._mute_original_during_transcript_enabled()
+            )
         self.gui.refresh_ui_state()
         self.gui._pipeline_advance("translation")
 
@@ -981,6 +989,10 @@ class SubtitleController:
 
         if show_message:
             QMessageBox.information(self.gui, "Applied", f"Applied edited translation to timeline.\nSegments: {len(segments)}")
+        if hasattr(self.gui, "_invalidate_original_audio_mute_cache"):
+            self.gui._invalidate_original_audio_mute_cache(
+                refresh=self.gui._mute_original_during_transcript_enabled()
+            )
         self.gui.refresh_ui_state()
         self.gui.schedule_auto_frame_preview()
         return True
