@@ -68,6 +68,7 @@ class TranslationOrchestrator:
 
                     print(f"[AI Translation] Success: completed via {', '.join(providers_used) or 'AI'}")
                     final_segments = clone_with_texts(segments, translated_texts, provider=provider_type, polished=True)
+                    final_segments = self.condense_segments_for_timeline(final_segments)
                     return TranslationResult(
                         success=True,
                         segments=final_segments,
@@ -118,6 +119,7 @@ class TranslationOrchestrator:
 
             print("[Translation] Success: Google web translate completed.")
             final_segments = clone_with_texts(segments, translated_texts, provider="google-web", polished=False)
+            final_segments = self.condense_segments_for_timeline(final_segments)
             return TranslationResult(
                 success=True,
                 segments=final_segments,
@@ -187,6 +189,7 @@ class TranslationOrchestrator:
                         "polished": True,
                     }
                 )
+            final_segments = self.condense_segments_for_timeline(final_segments)
             return TranslationResult(
                 success=True,
                 segments=final_segments,
@@ -197,6 +200,24 @@ class TranslationOrchestrator:
             )
         except Exception as exc:
             return TranslationResult(success=False, errors=[str(exc)], stage="rewrite")
+
+    def condense_segments_for_timeline(self, segments: list[dict]) -> list[dict]:
+        from .srt_utils import condense_dialogue_for_timeline
+
+        condensed = []
+        for seg in segments or []:
+            item = dict(seg)
+            start = float(item.get("start", 0.0) or 0.0)
+            end = float(item.get("end", 0.0) or 0.0)
+            dur = max(0.0, end - start)
+            text = str(item.get("text", "") or "")
+            if dur > 0 and text:
+                new_text = condense_dialogue_for_timeline(text, dur)
+                if new_text != text:
+                    item["_uncondensed_text"] = text
+                    item["text"] = new_text
+            condensed.append(item)
+        return condensed
 
     def translate_srt(self, srt_content: str, **kwargs) -> TranslationResult:
         segments = parse_srt(srt_content)

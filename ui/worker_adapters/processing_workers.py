@@ -787,10 +787,32 @@ class VoiceOverWorker(QThread):
 
 
 class FinalExportWorker(QThread):
-    finished = Signal(str, str)
+    finished = Signal(object, str)
     progress = Signal(int, str)
 
-    def __init__(self, workspace_root, video_path, output_path, mode, srt_path="", ass_path="", audio_path="", subtitle_style=None, output_quality="source", output_fps="source", output_ratio="source", output_scale_mode="fit", output_fill_focus_x=0.5, output_fill_focus_y=0.5, video_filter_state=None, original_audio_gain_db=0.0, project_state_path="", project_temp_dir=""):
+    def __init__(
+        self,
+        workspace_root,
+        video_path,
+        output_path,
+        mode,
+        srt_path="",
+        ass_path="",
+        audio_path="",
+        subtitle_style=None,
+        output_quality="source",
+        output_fps="source",
+        output_ratio="source",
+        output_scale_mode="fit",
+        output_fill_focus_x=0.5,
+        output_fill_focus_y=0.5,
+        video_filter_state=None,
+        original_audio_gain_db=0.0,
+        project_state_path="",
+        project_temp_dir="",
+        export_mode="full",
+        split_count=1,
+    ):
         super().__init__()
         self.workspace_root = workspace_root
         self.video_path = video_path
@@ -810,6 +832,8 @@ class FinalExportWorker(QThread):
         self.original_audio_gain_db = float(original_audio_gain_db or 0.0)
         self.project_state_path = project_state_path
         self.project_temp_dir = project_temp_dir
+        self.export_mode = str(export_mode or "full")
+        self.split_count = int(split_count or 1)
 
     def run(self):
         try:
@@ -838,11 +862,13 @@ class FinalExportWorker(QThread):
                         "original_audio_gain_db": self.original_audio_gain_db,
                         "project_state_path": self.project_state_path,
                         "project_temp_dir": self.project_temp_dir,
+                        "export_mode": self.export_mode,
+                        "split_count": self.split_count,
                     },
                     timeout=3600,
                 )
                 self.progress.emit(100, "Export complete.")
-                self.finished.emit(str(response.get("output_path", "")), "")
+                self.finished.emit(response.get("output_path", ""), "")
             else:
                 from workflows.export_workflow import ExportWorkflow
                 workflow = ExportWorkflow(self.workspace_root)
@@ -864,6 +890,8 @@ class FinalExportWorker(QThread):
                     original_audio_gain_db=self.original_audio_gain_db,
                     project_state_path=self.project_state_path,
                     project_temp_dir=self.project_temp_dir,
+                    export_mode=self.export_mode,
+                    split_count=self.split_count,
                     on_progress=self.progress.emit,
                 )
                 self.finished.emit(output_path, "")

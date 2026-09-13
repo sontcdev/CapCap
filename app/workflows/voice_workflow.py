@@ -319,8 +319,8 @@ class VoiceWorkflow:
 
     def _max_words_vi(self, duration_sec: float, speech_cost: int) -> int:
         duration = max(0.0, float(duration_sec))
-        words_per_sec = 4.0 if speech_cost >= 3 else 4.5
-        return max(1, int(duration * words_per_sec))
+        words_per_sec = 3.0 if speech_cost >= 3 else 3.3
+        return max(2, int(round(duration * words_per_sec)))
 
     def _target_words_for_ratio(
         self,
@@ -804,6 +804,7 @@ class VoiceWorkflow:
         log: bool = True,
     ):
         prepared = []
+        adjusted_count = 0
         for seg in list(segments or []):
             current = dict(seg or {})
             subtitle_text = (current.get("text") or "").strip()
@@ -819,7 +820,22 @@ class VoiceWorkflow:
                 normalizer_dictionary=normalizer_dictionary,
             )
             action_taken = "manual_voice" if voice_edited else "accept"
-            current["tts_text"] = spoken_text if voice_edited and spoken_text != subtitle_text else ""
+
+            if not voice_edited and duration_sec > 0 and spoken_words > max_words_vi:
+                from translation.srt_utils import condense_dialogue_for_timeline
+
+                condensed = condense_dialogue_for_timeline(spoken_text, duration_sec)
+                if condensed and condensed != spoken_text:
+                    spoken_text = condensed
+                    action_taken = "condensed_for_timeline"
+                    adjusted_count += 1
+                    spoken_words = self._count_spoken_words(
+                        spoken_text,
+                        voice_provider=voice_provider,
+                        normalizer_dictionary=normalizer_dictionary,
+                    )
+
+            current["tts_text"] = spoken_text if (voice_edited or action_taken == "condensed_for_timeline") and spoken_text != subtitle_text else ""
             current["dubbing_vi"] = spoken_text
             current["subtitle_vi"] = subtitle_text
             current["voice_edited"] = voice_edited
@@ -841,7 +857,7 @@ class VoiceWorkflow:
             }
             prepared.append(current)
         if log:
-            print(f"[Voice Workflow] Prepared TTS text: adjusted=0/{len(prepared)}")
+            print(f"[Voice Workflow] Prepared TTS text: adjusted={adjusted_count}/{len(prepared)}")
         return prepared
 
     def _probe_wav_duration_seconds(self, wav_path: str) -> float:

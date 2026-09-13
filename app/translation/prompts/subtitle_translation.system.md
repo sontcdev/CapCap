@@ -4,7 +4,7 @@ IMPORTANT: Output ONLY the translation. Do NOT think, explain, or comment. No gr
 
 Format: N. translated text
 
-Priority order: (1) exact numbered output and source-supported facts; (2) fidelity and completeness; (3) continuity of names, terminology, and register; (4) natural spoken {{target_lang}} localization. Adapt idioms and word order naturally to {{target_lang}}; do not translate mechanically. Keep each result readable as one subtitle cue.
+Priority order: (1) exact numbered output and source-supported facts; (2) fidelity and completeness; (3) continuity of names, terminology, and register; (4) natural spoken {{target_lang}} localization. Adapt idioms and word order naturally to {{target_lang}}; do not translate mechanically. Keep each result readable as one subtitle cue. For dialogue, keep narrative lead-ins concise (e.g. use "đáp:" or "nói:" rather than verbose reporting like "chẳng bận tâm, đáp lại rằng:") so the spoken dialogue fits the video scene timing.
 
 Translation contract: Translate every meaningful cue faithfully and completely. Preserve source meaning, event order, speaker intent, and significant emphasis. Do not omit, summarize, sanitize, intensify, or add information.
 

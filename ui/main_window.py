@@ -12225,16 +12225,25 @@ class VideoTranslatorGUI(QMainWindow):
             return
 
         source_segments = self.current_translated_segments or self.current_segments
-        text = str(source_segments[index].get("tts_text") or source_segments[index].get("text", "")).strip()
+        target_seg = source_segments[index] if 0 <= index < len(source_segments) else {}
+        text = str(target_seg.get("tts_text") or target_seg.get("text", "")).strip()
         if not text:
             QMessageBox.warning(self, "Missing Subtitle", "This subtitle line is empty.")
             return
 
-        voice_name = self.get_active_voice_name()
+        voice_name = str(target_seg.get("voice_name") or self.get_active_voice_name() or "").strip()
         if not voice_name:
             QMessageBox.warning(self, "Missing Voice", "Choose a voice first before generating subtitle audio preview.")
             return
-        voice_speed = self._parse_voice_speed_value()
+
+        seg_speed = target_seg.get("voice_speed")
+        if seg_speed is not None:
+            try:
+                voice_speed = float(seg_speed)
+            except (TypeError, ValueError):
+                voice_speed = self._parse_voice_speed_value()
+        else:
+            voice_speed = self._parse_voice_speed_value()
         project_state = getattr(self, "current_project_state", None) or self.ensure_current_project()
         project_settings = getattr(project_state, "settings", {}) or {}
         normalizer_dictionary = dict(project_settings.get("normalizer_dictionary", {}) or {})

@@ -119,16 +119,16 @@ def fit_wav_to_duration(
         ]
     elif mode_key == "smart":
         # Smart mode: when the audio is too long (fit_ratio < 1.0, meaning source_duration > target_duration),
-        # TRIM (cut) it to match the target duration instead of speeding it up.
-        # When it's too short (fit_ratio > 1.0), stretch (atempo) up to the safe range.
+        # speed it up with atempo so that spoken words are preserved and NOT cut off.
+        # When it's too short (fit_ratio > 1.0), stretch (slow down) up to the safe range.
         if abs(fit_ratio - 1.0) < 0.02:
             return input_wav_path
         if fit_ratio < 1.0:
-            # Audio longer than target — TRIM (cut) to fit, no speed
-            # change. Use ffmpeg's `-t` flag to set the output duration.
+            speed_factor = 1.0 / fit_ratio
+            filter_chain = _build_atempo_filter(speed_factor)
             cmd = [
                 ffmpeg, "-y", "-i", input_wav_path,
-                "-t", str(target_duration),
+                "-filter:a", filter_chain,
                 "-ar", "16000", "-ac", "1",
                 output_wav_path,
             ]
@@ -733,23 +733,7 @@ def build_voice_track_from_srt_segments(
                         clip = clip + AudioSegment.silent(duration=silent_ms, frame_rate=16000)
             elif clip_len > max_len:
                 sync_key = (timing_sync_mode or "smart").strip().lower()
-                if sync_key in ("force", "force fit"):
-                    fit_dir = tempfile.mkdtemp(prefix="capcap_voice_fit_")
-                    fit_path = os.path.join(fit_dir, f"segment_{idx:04d}.wav")
-                    try:
-                        fitted_path = fit_wav_to_duration(
-                            input_wav_path=wav_path,
-                            output_wav_path=fit_path,
-                            target_duration_seconds=max_len / 1000.0,
-                            mode="force",
-                        )
-                        if fitted_path != wav_path and os.path.exists(fitted_path):
-                            clip = AudioSegment.from_file(fitted_path)
-                    except (FileNotFoundError, OSError, RuntimeError):
-                        pass
-                    finally:
-                        shutil.rmtree(fit_dir, ignore_errors=True)
-                elif sync_key in ("smart", "timeline", "timeline priority") and clip_len <= max_len * 1.08:
+                if sync_key in ("force", "force fit", "smart", "timeline", "timeline priority"):
                     fit_dir = tempfile.mkdtemp(prefix="capcap_voice_fit_")
                     fit_path = os.path.join(fit_dir, f"segment_{idx:04d}.wav")
                     try:

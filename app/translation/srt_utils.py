@@ -156,3 +156,110 @@ def parse_numbered_line_items(raw: str) -> list[tuple[int, str]]:
 def parse_numbered_lines(raw: str) -> list[str]:
     """Backward-compatible text-only parser for numbered model output."""
     return [text for _number, text in parse_numbered_line_items(raw)]
+
+
+def condense_dialogue_for_timeline(text: str, duration: float) -> str:
+    """Condense dialogue/subtitle text when its length exceeds natural speech duration for its timeline segment."""
+    val = " ".join(str(text or "").replace("\n", " ").split()).strip()
+    if not val or duration <= 0:
+        return val
+    words = val.split()
+    budget = max(3, int(round(duration * 3.2)))
+    if len(words) <= budget:
+        return val
+
+    result = val
+
+    # 1. Condense reporting/narrative lead-in clauses before dialogue
+    patterns = [
+        (
+            r"([A-Za-zÀ-ỹ0-9_]+(?:\s+[A-Za-zÀ-ỹ0-9_]+){0,3})\s+(?:chẳng bận tâm|không thèm để ý|không bận tâm|không chút do dự|không hề do dự|không khỏi cảm thán|vô cùng ngạc nhiên|kinh ngạc|đầy tự tin|tự tin|tức giận|bất lực|hốt hoảng|lo lắng|nghĩ một lúc|suy nghĩ một lát|không cho là đúng)\s*[,，]?\s*(?:đáp lại|trả lời rằng|hét lên rằng|la lên rằng|cảm thán rằng|mở miệng nói rằng|mở miệng nói|nói rằng|đáp|nói):\s*",
+            r"\1 đáp: ",
+        ),
+        (
+            r"([A-Za-zÀ-ỹ0-9_]+(?:\s+[A-Za-zÀ-ỹ0-9_]+){0,3})\s+(?:không khỏi mỉm cười|không khỏi cười|mỉm cười|cười khẩy|cười lớn|bật cười)\s*[,，]?\s*(?:nói rằng|đáp lại|nói):\s*",
+            r"\1 cười nói: ",
+        ),
+        (
+            r"([A-Za-zÀ-ỹ0-9_]+(?:\s+[A-Za-zÀ-ỹ0-9_]+){0,3})\s+(?:tức giận|bực bội|giận dữ)\s*[,，]?\s*(?:quát|hét|nói):\s*",
+            r"\1 quát: ",
+        ),
+        (
+            r"([A-Za-zÀ-ỹ0-9_]+(?:\s+[A-Za-zÀ-ỹ0-9_]+){0,3})\s+(?:nghi ngờ|thắc mắc|tò mò)\s*[,，]?\s*(?:hỏi lại|hỏi rằng|lên tiếng hỏi):\s*",
+            r"\1 hỏi: ",
+        ),
+        (
+            r"([A-Za-zÀ-ỹ0-9_]+(?:\s+[A-Za-zÀ-ỹ0-9_]+){0,3})\s+(?:đã\s+)?(?:lên tiếng cảnh báo|cảnh báo anh trai rằng|cảnh báo rằng):\s*",
+            r"\1 cảnh báo: ",
+        ),
+        (
+            r"([A-Za-zÀ-ỹ0-9_]+(?:\s+[A-Za-zÀ-ỹ0-9_]+){0,3})\s+(?:nhanh chóng|vội vàng|vội vã)\s*[,，]?\s*(?:lên tiếng|nói):\s*",
+            r"\1 vội nói: ",
+        ),
+        (
+            r"([A-Za-zÀ-ỹ0-9_]+(?:\s+[A-Za-zÀ-ỹ0-9_]+){0,3})\s+(?:liền|trực tiếp|bèn|bèn mở miệng|lại tiếp tục)\s*[,，]?\s*(?:nói rằng|đáp rằng|hỏi rằng):\s*",
+            r"\1 nói: ",
+        ),
+    ]
+    for pat, rep in patterns:
+        new_val = re.sub(pat, rep, result, flags=re.IGNORECASE)
+        if new_val != result:
+            result = " ".join(new_val.split()).strip()
+            if len(result.split()) <= budget:
+                return result
+
+    # 2. Phrase contractions in dialogue
+    contractions = [
+        (r"\blàm sao bắn trúng được chứ\b", "sao bắn trúng nổi"),
+        (r"\blàm sao mà\b", "sao"),
+        (r"\blàm sao\b", "sao"),
+        (r"\bkhông thể nào\b", "không thể"),
+        (r"\bnhư thế này\b", "thế này"),
+        (r"\bnhư thế đó\b", "thế đó"),
+        (r"\bngay lập tức\b", "ngay"),
+        (r"\bhoàn toàn không\b", "không hề"),
+        (r"\bchắc chắn sẽ\b", "sẽ"),
+        (r"\bcó thể sẽ\b", "có thể"),
+        (r"\brốt cuộc là\b", "rốt cuộc"),
+        (r"\bthật sự là\b", "thực sự"),
+        (r"\bthì ra là\b", "hóa ra"),
+        (r"\bmột cách\s+", ""),
+        (r"\bvề cơ bản\b", ""),
+        (r"\bcó thể nói là\b", ""),
+    ]
+    for p, r in contractions:
+        result = re.sub(p, r, result, flags=re.IGNORECASE)
+        result = " ".join(result.split()).strip()
+        if len(result.split()) <= budget:
+            return result
+
+    # 3. Filler word removal if still over budget
+    tokens = result.split()
+    if len(tokens) > budget:
+        filler_words = {"thì", "mà", "đó", "này", "ấy", "vậy", "luôn", "rồi", "đang", "đã", "khá", "rất"}
+        filtered = []
+        for t in tokens:
+            clean_t = re.sub(r"[^\wÀ-ỹ]", "", t).lower()
+            if clean_t in filler_words and len(tokens) - len(filtered) > 1:
+                continue
+            filtered.append(t)
+        if len(filtered) >= budget:
+            result = " ".join(filtered)
+            if len(result.split()) <= budget:
+                return result
+
+    # 4. Graceful trimming keeping speaker prefix if present
+    cur_tokens = result.split()
+    if len(cur_tokens) > budget:
+        if ":" in result:
+            parts = result.split(":", 1)
+            speaker = parts[0].strip() + ": "
+            dialogue_tokens = parts[1].strip().split()
+            avail = max(2, budget - len(speaker.split()))
+            punct = "?" if "?" in parts[1] else ("!" if "!" in parts[1] else ".")
+            result = speaker + " ".join(dialogue_tokens[:avail]).strip(" ,;:") + punct
+        else:
+            punct = "?" if "?" in result else ("!" if "!" in result else ".")
+            result = " ".join(cur_tokens[:budget]).strip(" ,;:") + punct
+
+    return result
