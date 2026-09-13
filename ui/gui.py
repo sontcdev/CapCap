@@ -7,10 +7,32 @@ import traceback
 _SINGLE_INSTANCE_HANDLE = None
 
 
+def _is_multi_instance_allowed() -> bool:
+    multi_flags = {"--multi", "--allow-multiple", "-m"}
+    if any(arg.lower() in multi_flags for arg in sys.argv):
+        return True
+    try:
+        from dotenv import load_dotenv
+
+        root = (
+            os.path.dirname(os.path.abspath(sys.executable))
+            if getattr(sys, "frozen", False)
+            else os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        )
+        env_file = os.path.join(root, ".env")
+        if os.path.exists(env_file):
+            load_dotenv(env_file)
+    except Exception:
+        pass
+    return os.getenv("CAPCAP_ALLOW_MULTIPLE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _acquire_single_instance() -> bool:
     """Allow only one GUI process (worker-server children are exempt)."""
     global _SINGLE_INSTANCE_HANDLE
     if os.name != "nt":
+        return True
+    if _is_multi_instance_allowed():
         return True
     try:
         import ctypes
@@ -33,6 +55,7 @@ def _acquire_single_instance() -> bool:
         # A mutex failure should never prevent the application from starting.
         return True
 
+
 from PySide6.QtCore import QTimer, QUrl
 from PySide6.QtWidgets import QApplication
 
@@ -47,6 +70,11 @@ if __name__ == "__main__" and ("--worker-server" in sys.argv or os.getenv("CAPCA
 
 if __name__ == "__main__" and not _acquire_single_instance():
     raise SystemExit(0)
+
+# Strip out custom CLI flags before passing argv to Qt
+for flag in ("--multi", "--allow-multiple", "-m"):
+    while flag in sys.argv:
+        sys.argv.remove(flag)
 
 from main_window import VideoTranslatorGUI
 
@@ -72,8 +100,8 @@ class _RuntimeLogCollector:
             log_dir = os.path.join(root, "temp")
             os.makedirs(log_dir, exist_ok=True)
             self._file_path = os.path.join(log_dir, "capcap_runtime.log")
-            with open(self._file_path, "w", encoding="utf-8") as handle:
-                handle.write("[CapCap] Runtime log started.\n")
+            with open(self._file_path, "a", encoding="utf-8") as handle:
+                handle.write(f"[CapCap] Runtime log started (pid={os.getpid()}).\n")
         except OSError:
             self._file_path = ""
 
